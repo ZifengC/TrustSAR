@@ -137,13 +137,20 @@ class UniSAR(BaseModel):
 
         return query_his_emb + click_item_his_emb, q_i_align_used
 
-    def get_all_his_emb(self, all_his, all_his_type):
+    '''转成embedding的地方-> 得到all_his_emb'''
+    def get_all_his_emb(self, all_his, all_his_type): 
+        #对推荐行为：只取 item embedding（e_i）
         rec_his = torch.masked_fill(all_his, all_his_type != 1, 0)
+        self._debug_tensor_range("rec_his_raw", rec_his)
         rec_his_emb = self.session_embedding.get_item_emb(rec_his)
         rec_his_emb = torch.masked_fill(rec_his_emb,
                                         (all_his_type != 1).unsqueeze(-1), 0)
-
+        #对搜索行为：调用 session_embedding.forward()
         src_session_his = torch.masked_fill(all_his, all_his_type != 2, 0)
+        src_limit = self.session_embedding.map_vocab['keyword'].shape[0]
+        self._debug_tensor_range("src_session_his_raw",
+                                 src_session_his,
+                                 limit=src_limit)
         src_his_emb, q_i_align_used = self.src_feat_process(
             self.session_embedding(src_session_his))
         src_his_emb = torch.masked_fill(src_his_emb,
@@ -163,6 +170,43 @@ class UniSAR(BaseModel):
 
         return repeat_feature_list, items_emb
 
+    def _debug_tensor_range(self, tag, tensor, limit=None):
+        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            return
+        flat = tensor.reshape(-1)
+        mi, ma = flat.min().item(), flat.max().item()
+        if limit is None:
+            limit = const.item_id_num
+        if mi < 0 or ma >= limit:
+            print(f"[UniSAR] {tag} 越界 shape={tensor.shape} "
+                  f"dtype={tensor.dtype} min={mi} max={ma} limit={limit}")
+
+    def _check_finite(self, tag, tensor):
+        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            return
+        finite_mask = torch.isfinite(tensor)
+        if torch.all(finite_mask):
+            return
+        finite_vals = tensor[finite_mask]
+        finite_min = finite_vals.min().item() if finite_vals.numel() > 0 else "NA"
+        finite_max = finite_vals.max().item() if finite_vals.numel() > 0 else "NA"
+        print(f"[UniSAR] {tag} 含非有限值 shape={tensor.shape} dtype={tensor.dtype} "
+              f"nan={torch.isnan(tensor).any().item()} "
+              f"inf={torch.isinf(tensor).any().item()} "
+              f"finite_min={finite_min} finite_max={finite_max}")
+
+    def match_mask_to_tensor(self, mask, tensor):
+        target_len = tensor.size(1)
+        if mask.size(1) == target_len:
+            return mask
+        if mask.size(1) > target_len:
+            return mask[:, :target_len]
+        pad = torch.ones(mask.size(0),
+                         target_len - mask.size(1),
+                         dtype=mask.dtype,
+                         device=mask.device)
+        return torch.cat([mask, pad], dim=1)
+
     def mean_pooling(self, output, his_len):
         return torch.sum(output, dim=1) / his_len.unsqueeze(-1)
 
@@ -179,55 +223,71 @@ class UniSAR(BaseModel):
 
     def forward(self, user, all_his, all_his_type, items_emb, domain):
         user_emb = self.session_embedding.get_user_emb(user)
+        self._check_finite("user_emb_raw", user_emb)
 
         all_his_emb, all_his_mask, q_i_align_used = self.get_all_his_emb(
             all_his, all_his_type)
+        self._check_finite("all_his_emb", all_his_emb)
 
-        rec_his_mask = torch.masked_select(all_his_mask,
-                                           (all_his_type == 1)).reshape(
-                                               (all_his_emb.shape[0],
-                                                const.max_rec_his_len))
-        src_his_mask = torch.masked_select(all_his_mask,
-                                           (all_his_type == 2)).reshape(
-                                               (all_his_emb.shape[0],
-                                                const.max_src_session_his_len))
-
-        all_his_emb_w_pos = all_his_emb + self.global_pos_emb(all_his_emb)
+        all_his_emb_w_pos = all_his_emb + self.global_pos_emb(all_his_emb) # Sequence Eu + positional embedding
 
         global_mask = all_his_type[:, :, None] == all_his_type[:, None, :]
+        # 调试：查看有效历史长度
+        valid_lens = (~all_his_mask).sum(dim=1)
+        zero_seq = int((valid_lens == 0).sum().item())
+        if zero_seq > 0:
+            max_len = int(valid_lens.max().item())
+            min_len = int(valid_lens.min().item())
+            print(f"[UniSAR] 有 {zero_seq} 条样本无历史（min_len={min_len}, max_len={max_len})")
 
         global_encoded = self.global_transformer(all_his_emb_w_pos,
                                                  all_his_mask, global_mask)
         src2rec, rec2src = self.split_rec_src(global_encoded, all_his_type)
+        self._check_finite("src2rec", src2rec)
+        self._check_finite("rec2src", rec2src)
 
         rec_his_emb, src_his_emb = self.split_rec_src(all_his_emb,
                                                       all_his_type)
+        rec_pad_mask = (rec_his_emb.abs().sum(dim=-1) == 0)
+        src_pad_mask = (src_his_emb.abs().sum(dim=-1) == 0)
         rec_his_emb_w_pos = rec_his_emb + self.rec_pos(rec_his_emb)
         src_his_emb_w_pos = src_his_emb + self.src_pos(src_his_emb)
 
-        rec2rec = self.rec_transformer(rec_his_emb_w_pos, rec_his_mask)
-        src2src = self.src_transformer(src_his_emb_w_pos, src_his_mask)
+        rec2rec = self.rec_transformer(rec_his_emb_w_pos, rec_pad_mask)
+        src2src = self.src_transformer(src_his_emb_w_pos, src_pad_mask)
+        rec_pad_mask = self.match_mask_to_tensor(rec_pad_mask, rec2rec)
+        src_pad_mask = self.match_mask_to_tensor(src_pad_mask, src2src)
+        self._check_finite("rec2rec", rec2rec)
+        self._check_finite("src2src", src2src)
+
+        src2rec_pad = (src2rec.abs().sum(dim=-1) == 0)
+        rec2src_pad = (rec2src.abs().sum(dim=-1) == 0)
+        rec2rec_pad = (rec2rec.abs().sum(dim=-1) == 0)
+        src2src_pad = (src2src.abs().sum(dim=-1) == 0)
 
         rec_fusion_decoded = self.rec_cross_fusion(
             tgt=rec2rec,
             memory=src2rec,
-            tgt_key_padding_mask=rec_his_mask,
-            memory_key_padding_mask=rec_his_mask)
+            tgt_key_padding_mask=rec_pad_mask,
+            memory_key_padding_mask=self.match_mask_to_tensor(src2rec_pad, src2rec))
+        self._check_finite("rec_fusion_decoded", rec_fusion_decoded)
 
         src_fusion_decoded = self.src_cross_fusion(
             tgt=src2src,
             memory=rec2src,
-            tgt_key_padding_mask=src_his_mask,
-            memory_key_padding_mask=src_his_mask)
+            tgt_key_padding_mask=src_pad_mask,
+            memory_key_padding_mask=self.match_mask_to_tensor(rec2src_pad, rec2src))
+        self._check_finite("src_fusion_decoded", src_fusion_decoded)
 
         his_cl_used = [
-            src2rec, rec2rec, rec_his_mask, rec2src, src2src, src_his_mask
+            src2rec, rec2rec, self.match_mask_to_tensor(rec_pad_mask, rec2rec),
+            rec2src, src2src, self.match_mask_to_tensor(src_pad_mask, src2src)
         ]
 
         if domain == 'rec':
             feature_list = [
-                rec_fusion_decoded, rec_his_mask, src_fusion_decoded,
-                src_his_mask, user_emb
+                rec_fusion_decoded, rec_pad_mask, src_fusion_decoded,
+                src_pad_mask, user_emb
             ]
             repeat_feature_list, items_emb = self.repeat_feat(
                 feature_list, items_emb)
@@ -239,6 +299,8 @@ class UniSAR(BaseModel):
                                                rec_his_mask)
         src_fusion = self.src_his_attn_pooling(src_fusion_decoded, items_emb,
                                                src_his_mask)
+        self._check_finite("rec_fusion", rec_fusion)
+        self._check_finite("src_fusion", src_fusion)
 
         user_feats = [rec_fusion, src_fusion, user_emb]
 
@@ -252,23 +314,35 @@ class UniSAR(BaseModel):
         if domain == "rec":
             item_emb = item_emb.reshape(-1, item_emb.size(-1))
 
-            output = self.ple_layer(
-                torch.cat([
-                    rec_interest, src_interest, item_emb, user_emb,
-                    self.rec_query.expand(item_emb.shape[0], -1)
-                ], -1))[0]
-
-            return self.rec_fc_layer(output)
+            concat = torch.cat([
+                rec_interest, src_interest, item_emb, user_emb,
+                self.rec_query.expand(item_emb.shape[0], -1)
+            ], -1)
+            if not torch.isfinite(concat).all():
+                print("[inter_pred-rec] concat 存在 NaN/Inf")
+            output = self.ple_layer(concat)[0]
+            if not torch.isfinite(output).all():
+                print("[inter_pred-rec] ple_layer 输出存在 NaN/Inf")
+            fc_out = self.rec_fc_layer(output)
+            if not torch.isfinite(fc_out).all():
+                print("[inter_pred-rec] rec_fc_layer 输出存在 NaN/Inf")
+            return fc_out
 
         elif domain == "src":
             if item_emb.dim() == 3:
                 [query_emb], item_emb = self.repeat_feat([query_emb], item_emb)
 
-            output = self.ple_layer(
-                torch.cat([
-                    rec_interest, src_interest, item_emb, user_emb, query_emb
-                ], -1))[1]
-            return self.src_fc_layer(output)
+            concat = torch.cat(
+                [rec_interest, src_interest, item_emb, user_emb, query_emb], -1)
+            if not torch.isfinite(concat).all():
+                print("[inter_pred-src] concat 存在 NaN/Inf")
+            output = self.ple_layer(concat)[1]
+            if not torch.isfinite(output).all():
+                print("[inter_pred-src] ple_layer 输出存在 NaN/Inf")
+            fc_out = self.src_fc_layer(output)
+            if not torch.isfinite(fc_out).all():
+                print("[inter_pred-src] src_fc_layer 输出存在 NaN/Inf")
+            return fc_out
 
     def rec_loss(self, inputs):
         user, all_his, all_his_type, pos_item, neg_items = inputs[
@@ -276,7 +350,9 @@ class UniSAR(BaseModel):
                 'item'], inputs['neg_items']
 
         items = torch.cat([pos_item.unsqueeze(1), neg_items], dim=1)
+        self._debug_tensor_range("rec_loss_items", items)
         items_emb = self.session_embedding.get_item_emb(items)
+        self._check_finite("rec_loss_items_emb", items_emb)
         batch_size = items_emb.size(0)
 
         user_feats, q_i_align_used, his_cl_used = self.forward(user,
@@ -292,6 +368,13 @@ class UniSAR(BaseModel):
 
         logits = logits.reshape((-1, ))
         labels = labels.reshape((-1, ))
+        print("[rec_loss] logits",
+            "shape=", logits.shape,
+            "min=", logits.min().item(),
+            "max=", logits.max().item(),
+            "nan=", torch.isnan(logits).any().item())
+
+
 
         total_loss = self.loss_fn(logits, labels)
         loss_dict = {}
@@ -335,7 +418,9 @@ class UniSAR(BaseModel):
                 'item'], inputs['neg_items']
 
         items = torch.cat([pos_item.unsqueeze(1), neg_items], dim=1)
+        self._debug_tensor_range("rec_predict_items", items)
         items_emb = self.session_embedding.get_item_emb(items)
+        self._check_finite("rec_predict_items_emb", items_emb)
         batch_size = items_emb.size(0)
 
         user_feats, q_i_align_used, his_cl_used = self.forward(user,
@@ -357,7 +442,9 @@ class UniSAR(BaseModel):
         query_emb = self.session_embedding.get_query_emb(query)
 
         items = torch.cat([pos_item.unsqueeze(1), neg_items], dim=1)
+        self._debug_tensor_range("src_loss_items", items)
         items_emb = self.session_embedding.get_item_emb(items)
+        self._check_finite("src_loss_items_emb", items_emb)
         batch_size = items_emb.size(0)
 
         user_feats, q_i_align_used, his_cl_used = self.forward(user,
@@ -422,7 +509,9 @@ class UniSAR(BaseModel):
         query_emb = self.session_embedding.get_query_emb(query)
 
         items = torch.cat([pos_item.unsqueeze(1), neg_items], dim=1)
+        self._debug_tensor_range("src_predict_items", items)
         items_emb = self.session_embedding.get_item_emb(items)
+        self._check_finite("src_predict_items_emb", items_emb)
         batch_size = items_emb.size(0)
 
         user_feats, q_i_align_used, his_cl_used = self.forward(user,
@@ -536,6 +625,11 @@ class Transformer(nn.Module):
                 his_emb: torch.Tensor,
                 src_key_padding_mask: torch.Tensor,
                 src_mask: torch.Tensor = None):
+        if not torch.isfinite(his_emb).all():
+            print("[Transformer] 输入 his_emb 存在 NaN/Inf")
+        if src_mask is not None and not torch.isfinite(src_mask.float()).all():
+            print("[Transformer] 输入 src_mask 存在 NaN/Inf")
+
         if src_mask is not None:
             src_mask_expand = src_mask.unsqueeze(1).expand(
                 (-1, self.num_heads, -1, -1)).reshape(
@@ -547,5 +641,7 @@ class Transformer(nn.Module):
         else:
             his_encoded = self.transformer_encoder(
                 src=his_emb, src_key_padding_mask=src_key_padding_mask)
+        if not torch.isfinite(his_encoded).all():
+            print("[Transformer] 输出 his_encoded 存在 NaN/Inf")
 
         return his_encoded

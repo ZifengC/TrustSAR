@@ -1,3 +1,9 @@
+'''数据和参数
+1. 所有文件路径
+2. embedding维度
+3. User/item feature (KuaiSAR)
+'''
+
 import os
 
 
@@ -22,20 +28,23 @@ def init_setting_Amazon():
     session_map_vocab = os.path.join(load_path,
                                      'vocab/src_session_vocab_np.pkl')
 
+    '''item'''
     global item_id_num, item_id_dim, item_feature_list, item_text_feature
     item_feature_list = ['item_id']
     item_text_feature = []
-    item_id_num = 61935 + 1
+    item_id_num = 1414450 #base item_vocab_np.pkl
     item_id_dim = 32
 
+    '''user'''
     global user_id_num, user_id_dim, user_feature_list
 
     user_feature_list = ['user_id']
-    user_id_num = 68223
+    user_id_num = 12389 #base user_vocab_np.pkl
     user_id_dim = 32
 
+    '''word'''
     global word_id_num, word_id_dim
-    word_id_num = 1866
+    word_id_num = 304640 #base query_vocab.pkl 最小ID: 0, 最大ID: 1865 共有 1866 个唯一ID
     word_id_dim = 32
 
     global final_emb_size
@@ -44,7 +53,7 @@ def init_setting_Amazon():
     global max_rec_his_len, max_src_session_his_len, max_session_item_len, max_query_word_len
     max_rec_his_len = 30
     max_src_session_his_len = 30
-    max_session_item_len = 1
+    max_session_item_len = 5
     max_query_word_len = 50
 
 
@@ -69,6 +78,8 @@ def init_setting_KuaiSAR():
     session_map_vocab = os.path.join(load_path,
                                      'vocab/src_session_vocab_np.pkl')
 
+
+    '''item'''
     global item_feature_list, item_text_feature, item_id_num, first_level_category_id_num, second_level_category_id_num, \
     item_id_dim, first_level_category_id_dim, second_level_category_id_dim
 
@@ -78,13 +89,14 @@ def init_setting_KuaiSAR():
     ]
     item_text_feature = ['caption']
 
-    item_id_num = 673415 + 1
-    first_level_category_id_num = 38
-    second_level_category_id_num = 297
+    item_id_num = 1414450
+    first_level_category_id_num = 3
+    second_level_category_id_num = 13
     item_id_dim = 32
     first_level_category_id_dim = 32
     second_level_category_id_dim = 32
 
+    '''user'''
     global user_id_num, onehot_feat1_num, onehot_feat2_num, search_active_level_num, rec_active_level_num,\
         user_feature_list
 
@@ -92,11 +104,11 @@ def init_setting_KuaiSAR():
         'user_id', 'onehot_feat1', 'onehot_feat2', 'search_active_level',
         'rec_active_level'
     ]
-    user_id_num = 22700
-    onehot_feat1_num = 8
-    onehot_feat2_num = 3
-    search_active_level_num = 7
-    rec_active_level_num = 4
+    user_id_num = 12389
+    onehot_feat1_num = 3
+    onehot_feat2_num = 11
+    search_active_level_num = 12
+    rec_active_level_num = 11
 
     global user_id_dim, onehot_feat1_dim, onehot_feat2_dim, search_active_level_dim, rec_active_level_dim
     user_id_dim = 32
@@ -105,13 +117,14 @@ def init_setting_KuaiSAR():
     search_active_level_dim = 32
     rec_active_level_dim = 32
 
+    '''word'''
     global word_id_num, word_id_dim, final_emb_size
-    word_id_num = 394912
+    word_id_num = 304640
     word_id_dim = 32
     final_emb_size = 64
 
     global max_rec_his_len, max_src_session_his_len, max_session_item_len, max_query_word_len
-    max_rec_his_len = 30
-    max_src_session_his_len = 30
+    max_rec_his_len = 10
+    max_src_session_his_len = 10
     max_session_item_len = 5
     max_query_word_len = 50
