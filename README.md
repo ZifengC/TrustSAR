@@ -1,19 +1,5 @@
 # Example of Git repository
-### Get remote
-```bash
-#stop controlling by git
-rm -rf .git 
 
-# set up remote
-git clone https://github.com/ZifengC/TrustSAR.git 
-cd TrustSAR
-git init
-git remote add origin https://github.com/ZifengC/TrustSAR.git
-
-# verify the remote is set
-git remote -v
-
-```
 ### Set Up Authentication -SSH
 ```bash
 # Generate a new SSH key (use your GitHub email)
@@ -29,6 +15,21 @@ ssh -T git@github.com
 git remote set-url origin git@github.com:ZifengC/TrustSAR.git
 ```
 
+### Get remote
+```bash
+#stop controlling by git
+rm -rf .git 
+
+# set up remote
+git clone https://github.com/ZifengC/TrustSAR.git 
+cd TrustSAR
+git init
+git remote add origin https://github.com/ZifengC/TrustSAR.git
+
+# verify the remote is set
+git remote -v
+
+```
 ### Change files and push
 ```bash
 # Stage all files
