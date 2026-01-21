@@ -6,7 +6,7 @@ rm -rf .git
 
 # set up remote
 git clone https://github.com/ZifengC/TrustSAR.git 
-cd mlops-project
+cd TrustSAR
 git init
 git remote add origin https://github.com/ZifengC/TrustSAR.git
 
