@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from copy import deepcopy
 from typing import List
 
 from utils import const
@@ -23,6 +25,8 @@ class UniSAR(BaseModel):
         parser.add_argument('--pred_hid_units',
                             type=List,
                             default=[200, 80, 1])
+
+        parser.add_argument('--memory_eps', type=float, default=0.01)
 
         return BaseModel.parse_model_args(parser)
 
@@ -72,17 +76,23 @@ class UniSAR(BaseModel):
                                          device=self.device,
                                          infoNCE_temp=self.his_cl_temp)
 
-        self.transformerDecoderLayer = nn.TransformerDecoderLayer(
+        self.rec_decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.item_size,
             nhead=self.num_heads,
             dim_feedforward=self.item_size,
             dropout=self.dropout,
             batch_first=True)
-
-        self.src_cross_fusion = nn.TransformerDecoder(
-            self.transformerDecoderLayer, num_layers=self.num_layers)
         self.rec_cross_fusion = nn.TransformerDecoder(
-            self.transformerDecoderLayer, num_layers=self.num_layers)
+            self.rec_decoder_layer, num_layers=self.num_layers)
+
+        self.src_decoder_layer = MemoryTransformerDecoderLayer(
+            d_model=self.item_size,
+            nhead=self.num_heads,
+            dim_feedforward=self.item_size,
+            dropout=self.dropout,
+            batch_first=True)
+        self.src_cross_fusion = MemoryTransformerDecoder(
+            self.src_decoder_layer, num_layers=self.num_layers)
 
         self.rec_his_attn_pooling = Target_Attention(self.item_size,
                                                      self.item_size)
@@ -118,6 +128,9 @@ class UniSAR(BaseModel):
                                                 dropout=self.dropout)
 
         self.loss_fn = nn.BCELoss()
+        self.memory_eps = args.memory_eps
+        self.trust_memory = SlowTrustMemory(dim=self.item_size,
+                                            epsilon=self.memory_eps)
         self._init_weights()
         self.to(self.device)
 
@@ -260,6 +273,25 @@ class UniSAR(BaseModel):
         self._check_finite("rec2rec", rec2rec)
         self._check_finite("src2src", src2src)
 
+        query_emb, click_item_mask, q_click_item_emb = q_i_align_used
+        click_item_sum = torch.sum(q_click_item_emb *
+                                   click_item_mask.unsqueeze(-1),
+                                   dim=-2)
+        click_count = click_item_mask.sum(-1, keepdim=True).clamp(min=1.0)
+        mean_click_item_emb = click_item_sum / click_count
+        has_click = click_item_mask.sum(-1) > 0
+
+        write_signal = torch.where(has_click.unsqueeze(-1),
+                                   mean_click_item_emb, src2src)
+        zero_hidden = (write_signal.abs().sum(-1, keepdim=True) == 0)
+        write_signal = torch.where(
+            (~has_click).unsqueeze(-1) & zero_hidden, query_emb, write_signal)
+        write_signal = torch.where(src_pad_mask.unsqueeze(-1),
+                                   torch.zeros_like(write_signal),
+                                   write_signal)
+
+        trust_bias, _ = self.trust_memory(write_signal, src_pad_mask)
+
         src2rec_pad = (src2rec.abs().sum(dim=-1) == 0)
         rec2src_pad = (rec2src.abs().sum(dim=-1) == 0)
         rec2rec_pad = (rec2rec.abs().sum(dim=-1) == 0)
@@ -276,7 +308,8 @@ class UniSAR(BaseModel):
             tgt=src2src,
             memory=rec2src,
             tgt_key_padding_mask=src_pad_mask,
-            memory_key_padding_mask=self.match_mask_to_tensor(rec2src_pad, rec2src))
+            memory_key_padding_mask=self.match_mask_to_tensor(rec2src_pad, rec2src),
+            memory_scale=trust_bias)
         self._check_finite("src_fusion_decoded", src_fusion_decoded)
 
         his_cl_used = [
@@ -606,6 +639,134 @@ class TransAlign(nn.Module):
         info_nce_loss = self.cl_loss_func(logits, labels)
 
         return info_nce_loss
+
+
+class SlowTrustMemory(nn.Module):
+    def __init__(self, dim: int, epsilon: float = 0.01):
+        super().__init__()
+        self.epsilon = epsilon
+        self.trust_proj = nn.Linear(dim, 1, bias=False)
+        nn.init.zeros_(self.trust_proj.weight)
+
+    def forward(self, write_signal: torch.Tensor, pad_mask: torch.Tensor):
+        """
+        write_signal: (batch, T, dim)
+        pad_mask: (batch, T) with True indicating padding
+        """
+        if write_signal.numel() == 0:
+            return write_signal.new_zeros((write_signal.size(0), 0)), None
+
+        batch, seq_len, dim = write_signal.shape
+        memory = write_signal.new_zeros((batch, dim))
+        biases = []
+        for t in range(seq_len):
+            update_gate = (~pad_mask[:, t]).float().unsqueeze(-1)
+            memory = (1 - self.epsilon * update_gate) * memory + \
+                self.epsilon * write_signal[:, t, :] * update_gate
+            bias = 1 + torch.tanh(self.trust_proj(memory)).squeeze(-1)
+            biases.append(bias)
+
+        bias_stack = torch.stack(biases, dim=1)
+        bias_stack = bias_stack.masked_fill(pad_mask, 1.0)
+        return bias_stack, memory
+
+
+class MemoryTransformerDecoderLayer(nn.Module):
+    def __init__(self,
+                 d_model: int,
+                 nhead: int,
+                 dim_feedforward: int = 2048,
+                 dropout: float = 0.1,
+                 batch_first: bool = False):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model,
+                                               nhead,
+                                               dropout=dropout,
+                                               batch_first=batch_first)
+        self.multihead_attn = nn.MultiheadAttention(d_model,
+                                                    nhead,
+                                                    dropout=dropout,
+                                                    batch_first=batch_first)
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = F.relu
+
+    def forward(self,
+                tgt: torch.Tensor,
+                memory: torch.Tensor,
+                tgt_mask: torch.Tensor = None,
+                memory_mask: torch.Tensor = None,
+                tgt_key_padding_mask: torch.Tensor = None,
+                memory_key_padding_mask: torch.Tensor = None,
+                memory_scale: torch.Tensor = None):
+        tgt2 = self.self_attn(tgt,
+                              tgt,
+                              tgt,
+                              attn_mask=tgt_mask,
+                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+
+        cross_query = tgt if memory_scale is None else tgt * memory_scale.unsqueeze(
+            -1)
+        tgt2 = self.multihead_attn(cross_query,
+                                   memory,
+                                   memory,
+                                   attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt
+
+
+class MemoryTransformerDecoder(nn.Module):
+    def __init__(self,
+                 decoder_layer: MemoryTransformerDecoderLayer,
+                 num_layers: int,
+                 norm: nn.Module = None):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [deepcopy(decoder_layer) for _ in range(num_layers)])
+        self.num_layers = num_layers
+        self.norm = norm
+
+    def forward(self,
+                tgt: torch.Tensor,
+                memory: torch.Tensor,
+                tgt_mask: torch.Tensor = None,
+                memory_mask: torch.Tensor = None,
+                tgt_key_padding_mask: torch.Tensor = None,
+                memory_key_padding_mask: torch.Tensor = None,
+                memory_scale: torch.Tensor = None):
+        output = tgt
+
+        for mod in self.layers:
+            output = mod(output,
+                         memory,
+                         tgt_mask=tgt_mask,
+                         memory_mask=memory_mask,
+                         tgt_key_padding_mask=tgt_key_padding_mask,
+                         memory_key_padding_mask=memory_key_padding_mask,
+                         memory_scale=memory_scale)
+
+        if self.norm is not None:
+            output = self.norm(output)
+
+        return output
 
 
 class Transformer(nn.Module):
