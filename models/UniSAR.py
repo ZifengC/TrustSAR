@@ -281,11 +281,26 @@ class UniSAR(BaseModel):
         mean_click_item_emb = click_item_sum / click_count
         has_click = click_item_mask.sum(-1) > 0
 
-        write_signal = torch.where(has_click.unsqueeze(-1),
-                                   mean_click_item_emb, src2src)
+        src_selector = (all_his_type == 2)
+        src_len = src2src.size(1)
+        src_mean_click = torch.masked_select(
+            mean_click_item_emb, src_selector.unsqueeze(-1)).reshape(
+                (mean_click_item_emb.size(0), src_len,
+                 mean_click_item_emb.size(-1)))
+        src_has_click = torch.masked_select(has_click,
+                                            src_selector).reshape(
+                                                (has_click.size(0), src_len))
+        src_query_emb = torch.masked_select(query_emb,
+                                            src_selector.unsqueeze(-1)).reshape(
+                                                (query_emb.size(0), src_len,
+                                                 query_emb.size(-1)))
+
+        write_signal = torch.where(src_has_click.unsqueeze(-1),
+                                   src_mean_click, src2src)
         zero_hidden = (write_signal.abs().sum(-1, keepdim=True) == 0)
         write_signal = torch.where(
-            (~has_click).unsqueeze(-1) & zero_hidden, query_emb, write_signal)
+            (~src_has_click).unsqueeze(-1) & zero_hidden, src_query_emb,
+            write_signal)
         write_signal = torch.where(src_pad_mask.unsqueeze(-1),
                                    torch.zeros_like(write_signal),
                                    write_signal)
