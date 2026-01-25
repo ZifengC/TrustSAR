@@ -361,6 +361,7 @@ class UniSAR(BaseModel):
             rec2src, src2src, self.match_mask_to_tensor(src_pad_mask, src2src)
         ]
 
+        rec_his_mask, src_his_mask = rec_pad_mask, src_pad_mask
         if domain == 'rec':
             feature_list = [
                 rec_fusion_decoded, rec_pad_mask, src_fusion_decoded,
