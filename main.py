@@ -11,7 +11,7 @@ from utils import const, utils
 def parse_global_args(parser: argparse.ArgumentParser):
     parser.add_argument('--gpu', type=str, default='0')
     parser.add_argument('--device', type=str, default='cuda:0')
-    parser.add_argument('--random_seed', type=int, default=20230601)
+    parser.add_argument('--random_seed', type=int, default=20260123)
     parser.add_argument('--time', type=str, default='none')
     parser.add_argument('--train', type=int, default=1)
     parser.add_argument('--test_path', type=str, default="")
