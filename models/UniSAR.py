@@ -26,7 +26,11 @@ class UniSAR(BaseModel):
                             type=List,
                             default=[200, 80, 1])
 
-        parser.add_argument('--memory_eps', type=float, default=0.01)
+        parser.add_argument('--memory_eps', type=float, default=0.001)
+        parser.add_argument('--memory_bias_min', type=float, default=0.8)
+        parser.add_argument('--memory_bias_max', type=float, default=1.2)
+        parser.add_argument('--memory_log', action='store_true')
+        parser.add_argument('--memory_log_interval', type=int, default=200)
 
         return BaseModel.parse_model_args(parser)
 
@@ -130,7 +134,12 @@ class UniSAR(BaseModel):
         self.loss_fn = nn.BCELoss()
         self.memory_eps = args.memory_eps
         self.trust_memory = SlowTrustMemory(dim=self.item_size,
-                                            epsilon=self.memory_eps)
+                                            epsilon=self.memory_eps,
+                                            clamp_min=args.memory_bias_min,
+                                            clamp_max=args.memory_bias_max)
+        self.memory_log = args.memory_log
+        self.memory_log_interval = args.memory_log_interval
+        self._memory_log_counter = 0
         self._init_weights()
         self.to(self.device)
 
@@ -273,39 +282,47 @@ class UniSAR(BaseModel):
         self._check_finite("rec2rec", rec2rec)
         self._check_finite("src2src", src2src)
 
-        query_emb, click_item_mask, q_click_item_emb = q_i_align_used
-        click_item_sum = torch.sum(q_click_item_emb *
-                                   click_item_mask.unsqueeze(-1),
-                                   dim=-2)
-        click_count = click_item_mask.sum(-1, keepdim=True).clamp(min=1.0)
-        mean_click_item_emb = click_item_sum / click_count
-        has_click = click_item_mask.sum(-1) > 0
+        trust_bias = None
+        memory_state = None
+        if domain == 'src':
+            query_emb, click_item_mask, q_click_item_emb = q_i_align_used
+            click_item_sum = torch.sum(q_click_item_emb *
+                                       click_item_mask.unsqueeze(-1),
+                                       dim=-2)
+            click_count = click_item_mask.sum(-1,
+                                              keepdim=True).clamp(min=1.0)
+            mean_click_item_emb = click_item_sum / click_count
+            has_click = click_item_mask.sum(-1) > 0
 
-        src_selector = (all_his_type == 2)
-        src_len = src2src.size(1)
-        src_mean_click = torch.masked_select(
-            mean_click_item_emb, src_selector.unsqueeze(-1)).reshape(
-                (mean_click_item_emb.size(0), src_len,
-                 mean_click_item_emb.size(-1)))
-        src_has_click = torch.masked_select(has_click,
-                                            src_selector).reshape(
-                                                (has_click.size(0), src_len))
-        src_query_emb = torch.masked_select(query_emb,
-                                            src_selector.unsqueeze(-1)).reshape(
-                                                (query_emb.size(0), src_len,
-                                                 query_emb.size(-1)))
+            src_selector = (all_his_type == 2)
+            src_len = src2src.size(1)
+            src_mean_click = torch.masked_select(
+                mean_click_item_emb, src_selector.unsqueeze(-1)).reshape(
+                    (mean_click_item_emb.size(0), src_len,
+                     mean_click_item_emb.size(-1)))
+            src_has_click = torch.masked_select(has_click,
+                                                src_selector).reshape(
+                                                    (has_click.size(0),
+                                                     src_len))
+            src_query_emb = torch.masked_select(
+                query_emb,
+                src_selector.unsqueeze(-1)).reshape(
+                    (query_emb.size(0), src_len, query_emb.size(-1)))
 
-        write_signal = torch.where(src_has_click.unsqueeze(-1),
-                                   src_mean_click, src2src)
-        zero_hidden = (write_signal.abs().sum(-1, keepdim=True) == 0)
-        write_signal = torch.where(
-            (~src_has_click).unsqueeze(-1) & zero_hidden, src_query_emb,
-            write_signal)
-        write_signal = torch.where(src_pad_mask.unsqueeze(-1),
-                                   torch.zeros_like(write_signal),
-                                   write_signal)
+            write_signal = torch.where(src_has_click.unsqueeze(-1),
+                                       src_mean_click, src2src)
+            zero_hidden = (write_signal.abs().sum(-1, keepdim=True) == 0)
+            write_signal = torch.where(
+                (~src_has_click).unsqueeze(-1) & zero_hidden, src_query_emb,
+                write_signal)
+            write_signal = torch.where(
+                src_pad_mask.unsqueeze(-1),
+                torch.zeros_like(write_signal),
+                write_signal)
 
-        trust_bias, _ = self.trust_memory(write_signal, src_pad_mask)
+            trust_bias, memory_state = self.trust_memory(write_signal,
+                                                         src_pad_mask,
+                                                         update_mask=src_has_click)
 
         src2rec_pad = (src2rec.abs().sum(dim=-1) == 0)
         rec2src_pad = (rec2src.abs().sum(dim=-1) == 0)
@@ -326,6 +343,18 @@ class UniSAR(BaseModel):
             memory_key_padding_mask=self.match_mask_to_tensor(rec2src_pad, rec2src),
             memory_scale=trust_bias)
         self._check_finite("src_fusion_decoded", src_fusion_decoded)
+
+        if self.memory_log and trust_bias is not None:
+            self._memory_log_counter += 1
+            if self._memory_log_counter % max(1, self.memory_log_interval) == 0:
+                tb = trust_bias
+                print("[MemoryLog]",
+                      f"step={self._memory_log_counter}",
+                      f"bias_mean={tb.mean().item():.4f}",
+                      f"bias_min={tb.min().item():.4f}",
+                      f"bias_max={tb.max().item():.4f}",
+                      f"w_norm={self.trust_memory.trust_proj.weight.norm().item():.4f}",
+                      f"mem_norm={memory_state.norm(dim=-1).mean().item():.4f}" if memory_state is not None else "")
 
         his_cl_used = [
             src2rec, rec2rec, self.match_mask_to_tensor(rec_pad_mask, rec2rec),
@@ -407,7 +436,7 @@ class UniSAR(BaseModel):
                                                                all_his,
                                                                all_his_type,
                                                                items_emb,
-                                                               domain='rec')
+                                                               domain='src')
 
         logits = self.inter_pred(user_feats, items_emb, domain="rec").reshape(
             (batch_size, -1))
@@ -475,7 +504,7 @@ class UniSAR(BaseModel):
                                                                all_his,
                                                                all_his_type,
                                                                items_emb,
-                                                               domain='rec')
+                                                               domain='src')
 
         logits = self.inter_pred(user_feats, items_emb, domain="rec").reshape(
             (batch_size, -1))
@@ -657,16 +686,26 @@ class TransAlign(nn.Module):
 
 
 class SlowTrustMemory(nn.Module):
-    def __init__(self, dim: int, epsilon: float = 0.01):
+    def __init__(self,
+                 dim: int,
+                 epsilon: float = 0.01,
+                 clamp_min: float = 0.8,
+                 clamp_max: float = 1.2):
         super().__init__()
         self.epsilon = epsilon
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
         self.trust_proj = nn.Linear(dim, 1, bias=False)
         nn.init.zeros_(self.trust_proj.weight)
 
-    def forward(self, write_signal: torch.Tensor, pad_mask: torch.Tensor):
+    def forward(self,
+                write_signal: torch.Tensor,
+                pad_mask: torch.Tensor,
+                update_mask: torch.Tensor = None):
         """
         write_signal: (batch, T, dim)
         pad_mask: (batch, T) with True indicating padding
+        update_mask: optional (batch, T) bool, True to update at t
         """
         if write_signal.numel() == 0:
             return write_signal.new_zeros((write_signal.size(0), 0)), None
@@ -676,6 +715,9 @@ class SlowTrustMemory(nn.Module):
         biases = []
         for t in range(seq_len):
             update_gate = (~pad_mask[:, t]).float().unsqueeze(-1)
+            if update_mask is not None:
+                update_gate = update_gate * update_mask[:, t].float().unsqueeze(
+                    -1)
             memory = (1 - self.epsilon * update_gate) * memory + \
                 self.epsilon * write_signal[:, t, :] * update_gate
             bias = 1 + torch.tanh(self.trust_proj(memory)).squeeze(-1)
@@ -683,6 +725,9 @@ class SlowTrustMemory(nn.Module):
 
         bias_stack = torch.stack(biases, dim=1)
         bias_stack = bias_stack.masked_fill(pad_mask, 1.0)
+        bias_stack = torch.clamp(bias_stack,
+                                 min=self.clamp_min,
+                                 max=self.clamp_max)
         return bias_stack, memory
 
 
