@@ -206,20 +206,76 @@ class BaseRunner(object):
 
     @staticmethod
     @torch.no_grad()
-    def predict(model: BaseModel, test_loader: DataLoader):
+    def predict(model: BaseModel,
+                test_loader: DataLoader,
+                return_sim: bool = False):
         model.eval()
         predictions = list()
+        sim_list = list() if return_sim else None
 
         start = time.time()
         for step, batch in enumerate(test_loader):
-            prediction = model.predict(utils.batch_to_gpu(batch, model.device))
+            batch_gpu = utils.batch_to_gpu(batch, model.device)
+            prediction = model.predict(batch_gpu)
             predictions.extend(prediction.cpu().data.numpy())
+            if return_sim:
+                sims = BaseRunner.compute_query_last_sim(model, batch_gpu)
+                sim_list.extend(sims.cpu().numpy().tolist())
 
         logging.info("model evaluate time used:{}s".format(time.time() -
                                                            start))
         predictions = np.array(predictions)
 
+        if return_sim:
+            return predictions, np.array(sim_list)
         return predictions
+
+    @staticmethod
+    @torch.no_grad()
+    def compute_query_last_sim(model: BaseModel, batch: dict) -> torch.Tensor:
+        """
+        仅用于搜索数据：计算当前 query 与最近一次交互（search 用 query，rec 用 item）的余弦相似度。
+        """
+        if 'query' not in batch or 'all_his' not in batch or 'all_his_type' not in batch:
+            return torch.zeros((batch['batch_size'], ), device=model.device)
+
+        query_emb = model.session_embedding.get_query_emb(batch['query'])
+        all_his = batch['all_his']
+        all_his_type = batch['all_his_type']
+        all_his_ts = batch.get('all_his_ts', None)
+
+        if all_his_ts is not None:
+            valid_mask = torch.isfinite(all_his_ts)
+        else:
+            valid_mask = all_his != 0
+
+        valid_lens = valid_mask.sum(dim=1)
+        last_idx = (valid_lens - 1).clamp(min=0)
+        batch_indices = torch.arange(all_his.size(0), device=all_his.device)
+        last_item = all_his[batch_indices, last_idx]
+        last_type = all_his_type[batch_indices, last_idx]
+
+        last_emb = torch.zeros_like(query_emb)
+        rec_mask = last_type == 1
+        if rec_mask.any():
+            rec_ids = last_item[rec_mask]
+            rec_emb = model.session_embedding.get_item_emb(rec_ids)
+            last_emb[rec_mask] = rec_emb
+
+        src_mask = last_type == 2
+        if src_mask.any():
+            src_ids = last_item[src_mask].long()
+            keyword_map = model.session_embedding.map_vocab['keyword'].to(
+                model.device)
+            src_query_tokens = keyword_map[src_ids]
+            src_query_emb = model.session_embedding.get_query_emb(
+                src_query_tokens)
+            last_emb[src_mask] = src_query_emb
+
+        sims = torch.nn.functional.cosine_similarity(query_emb,
+                                                     last_emb,
+                                                     dim=-1)
+        return sims
 
     def evaluate(self, model: BaseModel, mode: str):
         raise NotImplementedError
@@ -371,10 +427,14 @@ class SarRunner(BaseRunner):
     def evaluate(self, model: BaseModel, mode: str):
         if mode == 'val':
             rec_predictions = self.predict(model, self.rec_val_loader)
-            src_predictions = self.predict(model, self.src_val_loader)
+            src_predictions, src_sims = self.predict(model,
+                                                     self.src_val_loader,
+                                                     return_sim=True)
         elif mode == 'test':
             rec_predictions = self.predict(model, self.rec_test_loader)
-            src_predictions = self.predict(model, self.src_test_loader)
+            src_predictions, src_sims = self.predict(model,
+                                                     self.src_test_loader,
+                                                     return_sim=True)
         else:
             raise ValueError('test set error')
         rec_results = self.evaluate_method(rec_predictions, self.topk,
@@ -386,5 +446,20 @@ class SarRunner(BaseRunner):
             "rec": utils.format_metric(rec_results),
             "src": utils.format_metric(src_results)
         }
+        if src_sims is not None and len(src_sims) > 0:
+            quantiles = np.quantile(src_sims, [1 / 3, 2 / 3])
+            buckets = [
+                src_sims <= quantiles[0],
+                (src_sims > quantiles[0]) & (src_sims <= quantiles[1]),
+                src_sims > quantiles[1]
+            ]
+            bucket_keys = ['low', 'mid', 'high']
+            for mask, bkey in zip(buckets, bucket_keys):
+                if mask.sum() == 0:
+                    continue
+                bucket_eval = self.evaluate_method(
+                    src_predictions[mask], self.topk, self.metrics)
+                results[f"src_{bkey}"] = utils.format_metric(bucket_eval)
+
         return results, (rec_results[self.main_metric] +
                          src_results[self.main_metric]) / 2.0
