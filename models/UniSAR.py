@@ -362,7 +362,7 @@ class UniSAR(BaseModel):
         ]
 
         rec_his_mask, src_his_mask = rec_pad_mask, src_pad_mask
-        if domain == 'rec':
+        if items_emb.dim() == 3:
             feature_list = [
                 rec_fusion_decoded, rec_pad_mask, src_fusion_decoded,
                 src_pad_mask, user_emb
