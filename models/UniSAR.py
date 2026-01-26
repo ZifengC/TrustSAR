@@ -140,6 +140,7 @@ class UniSAR(BaseModel):
         self.memory_log = args.memory_log
         self.memory_log_interval = args.memory_log_interval
         self._memory_log_counter = 0
+        self._last_trust_bias = None
         self._init_weights()
         self.to(self.device)
 
@@ -284,6 +285,7 @@ class UniSAR(BaseModel):
 
         trust_bias = None
         memory_state = None
+        self._last_trust_bias = None
         if domain == 'src':
             query_emb, click_item_mask, q_click_item_emb = q_i_align_used
             click_item_sum = torch.sum(q_click_item_emb *
@@ -304,17 +306,13 @@ class UniSAR(BaseModel):
                                                 src_selector).reshape(
                                                     (has_click.size(0),
                                                      src_len))
-            src_query_emb = torch.masked_select(
-                query_emb,
-                src_selector.unsqueeze(-1)).reshape(
-                    (query_emb.size(0), src_len, query_emb.size(-1)))
+            # 基于 rec2src_t 与搜索点击均值的一致性
+            sim_numer = (rec2src * src_mean_click).sum(dim=-1)
+            sim_denom = rec2src.norm(dim=-1) * src_mean_click.norm(dim=-1) + 1e-8
+            sim = sim_numer / sim_denom
+            sim = sim.masked_fill(~src_has_click, 0.0)
 
-            write_signal = torch.where(src_has_click.unsqueeze(-1),
-                                       src_mean_click, src2src)
-            zero_hidden = (write_signal.abs().sum(-1, keepdim=True) == 0)
-            write_signal = torch.where(
-                (~src_has_click).unsqueeze(-1) & zero_hidden, src_query_emb,
-                write_signal)
+            write_signal = rec2src * sim.unsqueeze(-1)
             write_signal = torch.where(
                 src_pad_mask.unsqueeze(-1),
                 torch.zeros_like(write_signal),
@@ -323,6 +321,7 @@ class UniSAR(BaseModel):
             trust_bias, memory_state = self.trust_memory(write_signal,
                                                          src_pad_mask,
                                                          update_mask=src_has_click)
+            self._last_trust_bias = trust_bias
 
         src2rec_pad = (src2rec.abs().sum(dim=-1) == 0)
         rec2src_pad = (rec2src.abs().sum(dim=-1) == 0)
@@ -399,11 +398,7 @@ class UniSAR(BaseModel):
             if not torch.isfinite(concat).all():
                 print("[inter_pred-rec] concat 存在 NaN/Inf")
             output = self.ple_layer(concat)[0]
-            if not torch.isfinite(output).all():
-                print("[inter_pred-rec] ple_layer 输出存在 NaN/Inf")
             fc_out = self.rec_fc_layer(output)
-            if not torch.isfinite(fc_out).all():
-                print("[inter_pred-rec] rec_fc_layer 输出存在 NaN/Inf")
             return fc_out
 
         elif domain == "src":
@@ -412,14 +407,8 @@ class UniSAR(BaseModel):
 
             concat = torch.cat(
                 [rec_interest, src_interest, item_emb, user_emb, query_emb], -1)
-            if not torch.isfinite(concat).all():
-                print("[inter_pred-src] concat 存在 NaN/Inf")
             output = self.ple_layer(concat)[1]
-            if not torch.isfinite(output).all():
-                print("[inter_pred-src] ple_layer 输出存在 NaN/Inf")
             fc_out = self.src_fc_layer(output)
-            if not torch.isfinite(fc_out).all():
-                print("[inter_pred-src] src_fc_layer 输出存在 NaN/Inf")
             return fc_out
 
     def rec_loss(self, inputs):
@@ -446,11 +435,6 @@ class UniSAR(BaseModel):
 
         logits = logits.reshape((-1, ))
         labels = labels.reshape((-1, ))
-        print("[rec_loss] logits",
-            "shape=", logits.shape,
-            "min=", logits.min().item(),
-            "max=", logits.max().item(),
-            "nan=", torch.isnan(logits).any().item())
 
 
 
@@ -778,8 +762,11 @@ class MemoryTransformerDecoderLayer(nn.Module):
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
-        cross_query = tgt if memory_scale is None else tgt * memory_scale.unsqueeze(
-            -1)
+        if memory_scale is None:
+            cross_query = tgt
+        else:
+            inv_scale = 1.0 / (memory_scale.unsqueeze(-1) + 1e-8)
+            cross_query = tgt * inv_scale
         tgt2 = self.multihead_attn(cross_query,
                                    memory,
                                    memory,

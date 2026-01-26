@@ -134,6 +134,13 @@ class BaseModel(nn.Module):
         else:
             return self.rec_predict(inputs)
 
+    def predict_bt(self, inputs):
+        pred = self.predict(inputs)
+        bt = getattr(self, "_last_trust_bias", None)
+        if isinstance(bt, torch.Tensor):
+            bt = bt.mean(dim=1)
+        return pred, bt
+
     def rec_loss(self, inputs):
         raise NotImplementedError
 

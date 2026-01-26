@@ -208,10 +208,13 @@ class BaseRunner(object):
     @torch.no_grad()
     def predict(model: BaseModel,
                 test_loader: DataLoader,
-                return_sim: bool = False):
+                return_sim: bool = False,
+                return_hits: bool = False,
+                max_hit_log: int = 20):
         model.eval()
         predictions = list()
         sim_list = list() if return_sim else None
+        hit_info = [] if return_hits else None
 
         start = time.time()
         for step, batch in enumerate(test_loader):
@@ -221,13 +224,35 @@ class BaseRunner(object):
             if return_sim:
                 sims = BaseRunner.compute_query_last_sim(model, batch_gpu)
                 sim_list.extend(sims.cpu().numpy().tolist())
+            if return_hits and batch_gpu.get('search', False):
+                scores = prediction
+                if not torch.is_tensor(scores):
+                    scores = torch.tensor(scores, device=model.device)
+                gt = scores[:, 0:1]
+                rank = (scores > gt).sum(dim=1) + 1
+                hit_mask = rank == 1
+                if hit_mask.any() and len(hit_info) < max_hit_log:
+                    users = batch_gpu['user'].squeeze(-1)[hit_mask]
+                    items = batch_gpu['item'].squeeze(-1)[hit_mask]
+                    queries = batch_gpu['query'][hit_mask]
+                    for u, it, q in zip(users.tolist(),
+                                        items.tolist(),
+                                        queries.cpu().numpy().tolist()):
+                        hit_info.append({
+                            "user": u,
+                            "item": it,
+                            "query": q
+                        })
+                        if len(hit_info) >= max_hit_log:
+                            break
 
         logging.info("model evaluate time used:{}s".format(time.time() -
                                                            start))
         predictions = np.array(predictions)
 
-        if return_sim:
-            return predictions, np.array(sim_list)
+        sims_arr = np.array(sim_list) if return_sim else None
+        if return_sim or return_hits:
+            return predictions, sims_arr, hit_info
         return predictions
 
     @staticmethod
@@ -427,14 +452,18 @@ class SarRunner(BaseRunner):
     def evaluate(self, model: BaseModel, mode: str):
         if mode == 'val':
             rec_predictions = self.predict(model, self.rec_val_loader)
-            src_predictions, src_sims = self.predict(model,
-                                                     self.src_val_loader,
-                                                     return_sim=True)
+            src_predictions, src_sims, _ = self.predict(model,
+                                                        self.src_val_loader,
+                                                        return_sim=True,
+                                                        return_hits=False)
         elif mode == 'test':
             rec_predictions = self.predict(model, self.rec_test_loader)
-            src_predictions, src_sims = self.predict(model,
-                                                     self.src_test_loader,
-                                                     return_sim=True)
+            src_predictions, src_sims, hit_info = self.predict(
+                model,
+                self.src_test_loader,
+                return_sim=True,
+                return_hits=True,
+                max_hit_log=20)
         else:
             raise ValueError('test set error')
         rec_results = self.evaluate_method(rec_predictions, self.topk,
@@ -446,6 +475,11 @@ class SarRunner(BaseRunner):
             "rec": utils.format_metric(rec_results),
             "src": utils.format_metric(src_results)
         }
+        if mode == 'test' and 'hit_info' in locals() and hit_info:
+            logging.info("Sample search hits (top1 correct) [max 20]:")
+            for h in hit_info:
+                logging.info(f"user={h['user']} item={h['item']} query={h['query']}")
+
         if src_sims is not None and len(src_sims) > 0:
             quantiles = np.quantile(src_sims, [1 / 3, 2 / 3])
             buckets = [
