@@ -596,7 +596,7 @@ class UniSAR(BaseModel):
                                                                all_his,
                                                                all_his_type,
                                                                items_emb,
-                                                               domain='rec')
+                                                               domain='src')
 
         logits = self.inter_pred(user_feats,
                                  items_emb,
