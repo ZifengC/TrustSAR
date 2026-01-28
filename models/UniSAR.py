@@ -762,11 +762,8 @@ class MemoryTransformerDecoderLayer(nn.Module):
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
-        if memory_scale is None:
-            cross_query = tgt
-        else:
-            inv_scale = 1.0 / (memory_scale.unsqueeze(-1) + 1e-8)
-            cross_query = tgt * inv_scale
+        cross_query = tgt if memory_scale is None else tgt * memory_scale.unsqueeze(
+            -1)
         tgt2 = self.multihead_attn(cross_query,
                                    memory,
                                    memory,
