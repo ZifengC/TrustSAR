@@ -80,13 +80,13 @@ class UniSAR(BaseModel):
                                          device=self.device,
                                          infoNCE_temp=self.his_cl_temp)
 
-        self.rec_decoder_layer = nn.TransformerDecoderLayer(
+        self.rec_decoder_layer = MemoryTransformerDecoderLayer(
             d_model=self.item_size,
             nhead=self.num_heads,
             dim_feedforward=self.item_size,
             dropout=self.dropout,
             batch_first=True)
-        self.rec_cross_fusion = nn.TransformerDecoder(
+        self.rec_cross_fusion = MemoryTransformerDecoder(
             self.rec_decoder_layer, num_layers=self.num_layers)
 
         self.src_decoder_layer = MemoryTransformerDecoderLayer(
@@ -133,15 +133,23 @@ class UniSAR(BaseModel):
 
         self.loss_fn = nn.BCELoss()
         self.memory_eps = args.memory_eps
-        self.trust_memory = SlowTrustMemory(dim=self.item_size,
-                                            epsilon=self.memory_eps,
-                                            clamp_min=args.memory_bias_min,
-                                            clamp_max=args.memory_bias_max)
-        # 搜索自注意力的长期记忆，结构与 rec→src gate 一致
-        self.src_trust_memory = SlowTrustMemory(dim=self.item_size,
-                                                epsilon=self.memory_eps,
-                                                clamp_min=args.memory_bias_min,
-                                                clamp_max=args.memory_bias_max)
+        # 双分支信任记忆：src 用于 memory=rec2src / tgt=src2src，rec 用于 memory=src2rec / tgt=rec2rec
+        self.src_memory_trust_memory = SlowTrustMemory(dim=self.item_size,
+                                                       epsilon=self.memory_eps,
+                                                       clamp_min=args.memory_bias_min,
+                                                       clamp_max=args.memory_bias_max)
+        self.src_tgt_trust_memory = SlowTrustMemory(dim=self.item_size,
+                                                    epsilon=self.memory_eps,
+                                                    clamp_min=args.memory_bias_min,
+                                                    clamp_max=args.memory_bias_max)
+        self.rec_memory_trust_memory = SlowTrustMemory(dim=self.item_size,
+                                                       epsilon=self.memory_eps,
+                                                       clamp_min=args.memory_bias_min,
+                                                       clamp_max=args.memory_bias_max)
+        self.rec_tgt_trust_memory = SlowTrustMemory(dim=self.item_size,
+                                                    epsilon=self.memory_eps,
+                                                    clamp_min=args.memory_bias_min,
+                                                    clamp_max=args.memory_bias_max)
         self.memory_log = args.memory_log
         self.memory_log_interval = args.memory_log_interval
         self._memory_log_counter = 0
@@ -288,8 +296,36 @@ class UniSAR(BaseModel):
         self._check_finite("rec2rec", rec2rec)
         self._check_finite("src2src", src2src)
 
-        rec2src_trust_bias = None
-        src2src_trust_bias = None
+        # rec 分支 gate：由 rec2rec / src2rec 与推荐点击序列相似度生成
+        rec_has_click = ~rec_pad_mask
+        rec_sim_numer = (rec2rec * rec_his_emb).sum(dim=-1)
+        rec_sim_denom = rec2rec.norm(dim=-1) * rec_his_emb.norm(dim=-1) + 1e-8
+        rec_sim = rec_sim_numer / rec_sim_denom
+        rec_sim = rec_sim.masked_fill(~rec_has_click, 0.0)
+
+        rec_tgt_write = rec2rec * rec_sim.unsqueeze(-1)
+        rec_tgt_write = torch.where(
+            rec_pad_mask.unsqueeze(-1),
+            torch.zeros_like(rec_tgt_write),
+            rec_tgt_write)
+        rec_tgt_trust_bias, _ = self.rec_tgt_trust_memory(
+            rec_tgt_write, rec_pad_mask, update_mask=rec_has_click)
+
+        src2rec_sim_numer = (src2rec * rec_his_emb).sum(dim=-1)
+        src2rec_sim_denom = src2rec.norm(dim=-1) * rec_his_emb.norm(dim=-1) + 1e-8
+        src2rec_sim = src2rec_sim_numer / src2rec_sim_denom
+        src2rec_sim = src2rec_sim.masked_fill(~rec_has_click, 0.0)
+
+        rec_mem_write = src2rec * src2rec_sim.unsqueeze(-1)
+        rec_mem_write = torch.where(
+            rec_pad_mask.unsqueeze(-1),
+            torch.zeros_like(rec_mem_write),
+            rec_mem_write)
+        rec_memory_trust_bias, _ = self.rec_memory_trust_memory(
+            rec_mem_write, rec_pad_mask, update_mask=rec_has_click)
+
+        src_memory_trust_bias = None
+        src_tgt_trust_bias = None
         memory_state = None
         self._last_trust_bias = None
         if domain == 'src':
@@ -312,7 +348,7 @@ class UniSAR(BaseModel):
                                                 src_selector).reshape(
                                                     (has_click.size(0),
                                                      src_len))
-            # 基于 rec2src_t 与搜索点击均值的一致性
+            # src 分支 memory gate：rec2src 与搜索点击均值一致性
             sim_numer = (rec2src * src_mean_click).sum(dim=-1)
             sim_denom = rec2src.norm(dim=-1) * src_mean_click.norm(dim=-1) + 1e-8
             sim = sim_numer / sim_denom
@@ -324,12 +360,12 @@ class UniSAR(BaseModel):
                 torch.zeros_like(write_signal),
                 write_signal)
 
-            rec2src_trust_bias, memory_state = self.trust_memory(write_signal,
-                                                                 src_pad_mask,
-                                                                 update_mask=src_has_click)
-            self._last_trust_bias = rec2src_trust_bias
+            src_memory_trust_bias, memory_state = self.src_memory_trust_memory(write_signal,
+                                                                               src_pad_mask,
+                                                                               update_mask=src_has_click)
+            self._last_trust_bias = src_memory_trust_bias
 
-            # src2src 的慢更新信任记忆：write_signal_src = src2src_t * sim_src_t
+            # src 分支 tgt gate：src2src 与搜索点击均值一致性
             sim_src_numer = (src2src * src_mean_click).sum(dim=-1)
             sim_src_denom = src2src.norm(dim=-1) * src_mean_click.norm(dim=-1) + 1e-8
             sim_src = sim_src_numer / sim_src_denom
@@ -341,7 +377,7 @@ class UniSAR(BaseModel):
                 torch.zeros_like(src_write_signal),
                 src_write_signal)
 
-            src2src_trust_bias, _ = self.src_trust_memory(
+            src_tgt_trust_bias, _ = self.src_tgt_trust_memory(
                 src_write_signal, src_pad_mask, update_mask=src_has_click)
 
         src2rec_pad = (src2rec.abs().sum(dim=-1) == 0)
@@ -353,7 +389,9 @@ class UniSAR(BaseModel):
             tgt=rec2rec,
             memory=src2rec,
             tgt_key_padding_mask=rec_pad_mask,
-            memory_key_padding_mask=self.match_mask_to_tensor(src2rec_pad, src2rec))
+            memory_key_padding_mask=self.match_mask_to_tensor(src2rec_pad, src2rec),
+            memory_scale=rec_memory_trust_bias,
+            tgt_scale=rec_tgt_trust_bias)
         self._check_finite("rec_fusion_decoded", rec_fusion_decoded)
 
         src_fusion_decoded = self.src_cross_fusion(
@@ -361,20 +399,20 @@ class UniSAR(BaseModel):
             memory=rec2src,
             tgt_key_padding_mask=src_pad_mask,
             memory_key_padding_mask=self.match_mask_to_tensor(rec2src_pad, rec2src),
-            memory_scale=rec2src_trust_bias,
-            tgt_scale=src2src_trust_bias)
+            memory_scale=src_memory_trust_bias,
+            tgt_scale=src_tgt_trust_bias)
         self._check_finite("src_fusion_decoded", src_fusion_decoded)
 
-        if self.memory_log and rec2src_trust_bias is not None:
+        if self.memory_log and src_memory_trust_bias is not None:
             self._memory_log_counter += 1
             if self._memory_log_counter % max(1, self.memory_log_interval) == 0:
-                tb = rec2src_trust_bias
+                tb = src_memory_trust_bias
                 print("[MemoryLog]",
                       f"step={self._memory_log_counter}",
                       f"bias_mean={tb.mean().item():.4f}",
                       f"bias_min={tb.min().item():.4f}",
                       f"bias_max={tb.max().item():.4f}",
-                      f"w_norm={self.trust_memory.trust_proj.weight.norm().item():.4f}",
+                      f"w_norm={self.src_memory_trust_memory.trust_proj.weight.norm().item():.4f}",
                       f"mem_norm={memory_state.norm(dim=-1).mean().item():.4f}" if memory_state is not None else "")
 
         his_cl_used = [
