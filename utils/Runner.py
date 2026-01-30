@@ -481,13 +481,14 @@ class SarRunner(BaseRunner):
                 logging.info(f"user={h['user']} item={h['item']} query={h['query']}")
 
         if src_sims is not None and len(src_sims) > 0:
-            quantiles = np.quantile(src_sims, [1 / 3, 2 / 3])
+            # 按相似度分为 bottom 10%、mid 80%、top 10%
+            quantiles = np.quantile(src_sims, [0.1, 0.9])
             buckets = [
-                src_sims <= quantiles[0],
-                (src_sims > quantiles[0]) & (src_sims <= quantiles[1]),
-                src_sims > quantiles[1]
+                src_sims <= quantiles[0],  # bottom 10%
+                (src_sims > quantiles[0]) & (src_sims <= quantiles[1]),  # mid 80%
+                src_sims > quantiles[1]  # top 10%
             ]
-            bucket_keys = ['low', 'mid', 'high']
+            bucket_keys = ['bottom10', 'mid80', 'top10']
             for mask, bkey in zip(buckets, bucket_keys):
                 if mask.sum() == 0:
                     continue

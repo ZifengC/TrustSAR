@@ -762,11 +762,12 @@ class MemoryTransformerDecoderLayer(nn.Module):
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
-        cross_query = tgt if memory_scale is None else tgt * memory_scale.unsqueeze(
+        # 使用 trust bias 缩放 memory（来自 rec2src），而不是缩放当前查询序列
+        scaled_memory = memory if memory_scale is None else memory * memory_scale.unsqueeze(
             -1)
-        tgt2 = self.multihead_attn(cross_query,
-                                   memory,
-                                   memory,
+        tgt2 = self.multihead_attn(tgt,
+                                   scaled_memory,
+                                   scaled_memory,
                                    attn_mask=memory_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout2(tgt2)

@@ -1,4 +1,9 @@
 .DS_Store
 node_modules/
 .env
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
 
+# 忽略 VS Code 配置
+.vscode/
