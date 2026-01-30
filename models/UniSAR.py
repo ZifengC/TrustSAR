@@ -137,6 +137,11 @@ class UniSAR(BaseModel):
                                             epsilon=self.memory_eps,
                                             clamp_min=args.memory_bias_min,
                                             clamp_max=args.memory_bias_max)
+        # 搜索自注意力的长期记忆，结构与 rec→src gate 一致
+        self.src_trust_memory = SlowTrustMemory(dim=self.item_size,
+                                                epsilon=self.memory_eps,
+                                                clamp_min=args.memory_bias_min,
+                                                clamp_max=args.memory_bias_max)
         self.memory_log = args.memory_log
         self.memory_log_interval = args.memory_log_interval
         self._memory_log_counter = 0
@@ -283,7 +288,8 @@ class UniSAR(BaseModel):
         self._check_finite("rec2rec", rec2rec)
         self._check_finite("src2src", src2src)
 
-        trust_bias = None
+        rec2src_trust_bias = None
+        src2src_trust_bias = None
         memory_state = None
         self._last_trust_bias = None
         if domain == 'src':
@@ -318,10 +324,25 @@ class UniSAR(BaseModel):
                 torch.zeros_like(write_signal),
                 write_signal)
 
-            trust_bias, memory_state = self.trust_memory(write_signal,
-                                                         src_pad_mask,
-                                                         update_mask=src_has_click)
-            self._last_trust_bias = trust_bias
+            rec2src_trust_bias, memory_state = self.trust_memory(write_signal,
+                                                                 src_pad_mask,
+                                                                 update_mask=src_has_click)
+            self._last_trust_bias = rec2src_trust_bias
+
+            # src2src 的慢更新信任记忆：write_signal_src = src2src_t * sim_src_t
+            sim_src_numer = (src2src * src_mean_click).sum(dim=-1)
+            sim_src_denom = src2src.norm(dim=-1) * src_mean_click.norm(dim=-1) + 1e-8
+            sim_src = sim_src_numer / sim_src_denom
+            sim_src = sim_src.masked_fill(~src_has_click, 0.0)
+
+            src_write_signal = src2src * sim_src.unsqueeze(-1)
+            src_write_signal = torch.where(
+                src_pad_mask.unsqueeze(-1),
+                torch.zeros_like(src_write_signal),
+                src_write_signal)
+
+            src2src_trust_bias, _ = self.src_trust_memory(
+                src_write_signal, src_pad_mask, update_mask=src_has_click)
 
         src2rec_pad = (src2rec.abs().sum(dim=-1) == 0)
         rec2src_pad = (rec2src.abs().sum(dim=-1) == 0)
@@ -340,13 +361,14 @@ class UniSAR(BaseModel):
             memory=rec2src,
             tgt_key_padding_mask=src_pad_mask,
             memory_key_padding_mask=self.match_mask_to_tensor(rec2src_pad, rec2src),
-            memory_scale=trust_bias)
+            memory_scale=rec2src_trust_bias,
+            tgt_scale=src2src_trust_bias)
         self._check_finite("src_fusion_decoded", src_fusion_decoded)
 
-        if self.memory_log and trust_bias is not None:
+        if self.memory_log and rec2src_trust_bias is not None:
             self._memory_log_counter += 1
             if self._memory_log_counter % max(1, self.memory_log_interval) == 0:
-                tb = trust_bias
+                tb = rec2src_trust_bias
                 print("[MemoryLog]",
                       f"step={self._memory_log_counter}",
                       f"bias_mean={tb.mean().item():.4f}",
@@ -753,10 +775,13 @@ class MemoryTransformerDecoderLayer(nn.Module):
                 memory_mask: torch.Tensor = None,
                 tgt_key_padding_mask: torch.Tensor = None,
                 memory_key_padding_mask: torch.Tensor = None,
-                memory_scale: torch.Tensor = None):
-        tgt2 = self.self_attn(tgt,
-                              tgt,
-                              tgt,
+                memory_scale: torch.Tensor = None,
+                tgt_scale: torch.Tensor = None):
+        # 可选地对 tgt 施加信任门控
+        gated_tgt = tgt if tgt_scale is None else tgt * tgt_scale.unsqueeze(-1)
+        tgt2 = self.self_attn(gated_tgt,
+                              gated_tgt,
+                              gated_tgt,
                               attn_mask=tgt_mask,
                               key_padding_mask=tgt_key_padding_mask)[0]
         tgt = tgt + self.dropout1(tgt2)
@@ -797,7 +822,8 @@ class MemoryTransformerDecoder(nn.Module):
                 memory_mask: torch.Tensor = None,
                 tgt_key_padding_mask: torch.Tensor = None,
                 memory_key_padding_mask: torch.Tensor = None,
-                memory_scale: torch.Tensor = None):
+                memory_scale: torch.Tensor = None,
+                tgt_scale: torch.Tensor = None):
         output = tgt
 
         for mod in self.layers:
@@ -807,7 +833,8 @@ class MemoryTransformerDecoder(nn.Module):
                          memory_mask=memory_mask,
                          tgt_key_padding_mask=tgt_key_padding_mask,
                          memory_key_padding_mask=memory_key_padding_mask,
-                         memory_scale=memory_scale)
+                         memory_scale=memory_scale,
+                         tgt_scale=tgt_scale)
 
         if self.norm is not None:
             output = self.norm(output)
