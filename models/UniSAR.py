@@ -31,6 +31,8 @@ class UniSAR(BaseModel):
         parser.add_argument('--memory_bias_max', type=float, default=1.2)
         parser.add_argument('--memory_log', action='store_true')
         parser.add_argument('--memory_log_interval', type=int, default=200)
+        parser.add_argument('--gate_floor', type=float, default=0.85,
+                            help='Lower bound for gate blending to avoid hard suppression')
 
         return BaseModel.parse_model_args(parser)
 
@@ -815,8 +817,15 @@ class MemoryTransformerDecoderLayer(nn.Module):
                 memory_key_padding_mask: torch.Tensor = None,
                 memory_scale: torch.Tensor = None,
                 tgt_scale: torch.Tensor = None):
-        # 可选地对 tgt 施加信任门控
-        gated_tgt = tgt if tgt_scale is None else tgt * tgt_scale.unsqueeze(-1)
+        # Soft gate: convex blend to avoid hard zeroing (scale in [gate_floor, +inf))
+        gate_floor = getattr(self, 'gate_floor', 0.85)
+        def _blend(x, scale):
+            if scale is None:
+                return x
+            s = torch.clamp(scale, min=gate_floor).unsqueeze(-1)
+            return s * x + (1 - s) * x.detach()
+
+        gated_tgt = _blend(tgt, tgt_scale)
         tgt2 = self.self_attn(gated_tgt,
                               gated_tgt,
                               gated_tgt,
@@ -826,8 +835,7 @@ class MemoryTransformerDecoderLayer(nn.Module):
         tgt = self.norm1(tgt)
 
         # 使用 trust bias 缩放 memory（来自 rec2src），而不是缩放当前查询序列
-        scaled_memory = memory if memory_scale is None else memory * memory_scale.unsqueeze(
-            -1)
+        scaled_memory = _blend(memory, memory_scale)
         tgt2 = self.multihead_attn(tgt,
                                    scaled_memory,
                                    scaled_memory,

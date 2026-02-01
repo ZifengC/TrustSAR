@@ -16,6 +16,8 @@ class Sampler(object):
         self.search = search
         self.user_vocab = user_vocab #读用户字典-input1 vocab/user_vocab.pkl
         raw_data = pd.read_pickle(data_path) #读数据表-input2 dataset/rec_train.pkl
+        raw_data = self._filter_zero_entries(raw_data)
+        raw_data = self._filter_short_users(raw_data)
         self.virtual_rec_items = self._build_virtual_rec_items(raw_data)
         self.virtual_src_sessions = self._build_virtual_src_sessions(user_vocab)
         if {'rec_his', 'src_session_his'}.issubset(raw_data.columns):
@@ -189,3 +191,53 @@ class Sampler(object):
         if len(items) != max_len:
             raise ValueError(f"{source} history length mismatch: {len(items)}/{max_len}")
         return items, ts
+
+    def _filter_zero_entries(self, df: pd.DataFrame) -> pd.DataFrame:
+        """移除含有全零 embedding 的点击 / query，避免后续 gate 将其当作有效信号。
+        - 搜索点击 item: item_id == 0 直接删除
+        - 搜索 query: keyword 全 0（或为空列表）删除
+        - 推荐侧 query（若存在 keyword 字段）同样删除
+        """
+        before = len(df)
+        if 'item_id' in df.columns:
+            df = df[df['item_id'] != 0]
+
+        if 'keyword' in df.columns:
+            def _valid_kw(kw):
+                try:
+                    if isinstance(kw, str):
+                        kw = eval(kw)
+                    if isinstance(kw, int):
+                        kw = [kw]
+                    if not isinstance(kw, (list, tuple)):
+                        return True
+                    return any(int(x) != 0 for x in kw)
+                except Exception:
+                    return True
+            df = df[df['keyword'].apply(_valid_kw)]
+
+        removed = before - len(df)
+        if removed > 0:
+            print(f\"[Sampler] 过滤零 embedding 行 {removed}/{before} 条 -> {len(df)}\")
+        return df
+
+    def _filter_short_users(self, df: pd.DataFrame) -> pd.DataFrame:
+        """删除总历史（rec+src）长度 < 5 的用户对应的所有样本。"""
+        before = len(df)
+        if 'user_id' not in df.columns:
+            return df
+
+        def _total_len(uid: int) -> int:
+            info = self.user_vocab.get(uid, {})
+            rec_len = len(info.get('rec_his', []))
+            src_len = len(info.get('src_session_his', []))
+            return rec_len + src_len
+
+        valid_users = {uid for uid in df['user_id'].unique()
+                       if _total_len(int(uid)) >= 5}
+        df = df[df['user_id'].isin(valid_users)]
+
+        removed = before - len(df)
+        if removed > 0:
+            print(f\"[Sampler] 删除历史<5的用户样本 {removed}/{before} 条，剩余 {len(df)}\")
+        return df
