@@ -218,7 +218,7 @@ class Sampler(object):
 
         removed = before - len(df)
         if removed > 0:
-            print(f\"[Sampler] 过滤零 embedding 行 {removed}/{before} 条 -> {len(df)}\")
+            print(f"[Sampler] 过滤零 embedding 行 {removed}/{before} 条 -> {len(df)}")
         return df
 
     def _filter_short_users(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -239,5 +239,5 @@ class Sampler(object):
 
         removed = before - len(df)
         if removed > 0:
-            print(f\"[Sampler] 删除历史<5的用户样本 {removed}/{before} 条，剩余 {len(df)}\")
+            print(f"[Sampler] 删除历史<5的用户样本 {removed}/{before} 条，剩余 {len(df)}")
         return df

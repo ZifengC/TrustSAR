@@ -135,6 +135,7 @@ class UniSAR(BaseModel):
 
         self.loss_fn = nn.BCELoss()
         self.memory_eps = args.memory_eps
+        self.gate_floor = args.gate_floor
         # 双分支信任记忆：src 用于 memory=rec2src / tgt=src2src，rec 用于 memory=src2rec / tgt=rec2rec
         self.src_memory_trust_memory = SlowTrustMemory(dim=self.item_size,
                                                        epsilon=self.memory_eps,
