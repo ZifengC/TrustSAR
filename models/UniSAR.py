@@ -818,29 +818,29 @@ class MemoryTransformerDecoderLayer(nn.Module):
                 memory_key_padding_mask: torch.Tensor = None,
                 memory_scale: torch.Tensor = None,
                 tgt_scale: torch.Tensor = None):
-        # Soft gate: convex blend to avoid hard zeroing (scale in [gate_floor, +inf))
-        gate_floor = getattr(self, 'gate_floor', 0.85)
-        def _blend(x, scale):
-            if scale is None:
-                return x
-            s = torch.clamp(scale, min=gate_floor).unsqueeze(-1)
-            return s * x + (1 - s) * x.detach()
-
-        gated_tgt = _blend(tgt, tgt_scale)
-        tgt2 = self.self_attn(gated_tgt,
-                              gated_tgt,
-                              gated_tgt,
+        tgt2 = self.self_attn(tgt,
+                              tgt,
+                              tgt,
                               attn_mask=tgt_mask,
                               key_padding_mask=tgt_key_padding_mask)[0]
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
-        # 使用 trust bias 缩放 memory（来自 rec2src），而不是缩放当前查询序列
-        scaled_memory = _blend(memory, memory_scale)
+        # Additive attention bias based on trust gates
+        attn_bias = None
+        gate_floor = getattr(self, 'gate_floor', 0.85)
+        if tgt_scale is not None or memory_scale is not None:
+            attn_bias = memory.new_zeros((memory.size(0), tgt.size(1), memory.size(1)))
+            if tgt_scale is not None:
+                attn_bias = attn_bias + torch.log(torch.clamp(tgt_scale, min=gate_floor)).unsqueeze(-1)
+            if memory_scale is not None:
+                attn_bias = attn_bias + torch.log(torch.clamp(memory_scale, min=gate_floor)).unsqueeze(-2)
+            attn_bias = attn_bias.repeat_interleave(self.multihead_attn.num_heads, dim=0)
+
         tgt2 = self.multihead_attn(tgt,
-                                   scaled_memory,
-                                   scaled_memory,
-                                   attn_mask=memory_mask,
+                                   memory,
+                                   memory,
+                                   attn_mask=attn_bias if attn_bias is not None else memory_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
