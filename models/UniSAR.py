@@ -33,6 +33,12 @@ class UniSAR(BaseModel):
         parser.add_argument('--memory_log_interval', type=int, default=200)
         parser.add_argument('--gate_floor', type=float, default=0.85,
                             help='Lower bound for gate blending to avoid hard suppression')
+        parser.add_argument('--rec_tgt_boost', type=float, default=1.2,
+                            help='Multiplier for rec2rec trust gate')
+        parser.add_argument('--src2rec_conf_thresh', type=float, default=0.9,
+                            help='Confidence threshold for trusting src2rec gate')
+        parser.add_argument('--rec_use_src_interest', action='store_true',
+                            help='Whether to feed src_interest into rec prediction branch')
 
         return BaseModel.parse_model_args(parser)
 
@@ -136,6 +142,9 @@ class UniSAR(BaseModel):
         self.loss_fn = nn.BCELoss()
         self.memory_eps = args.memory_eps
         self.gate_floor = args.gate_floor
+        self.rec_tgt_boost = args.rec_tgt_boost
+        self.src2rec_conf_thresh = args.src2rec_conf_thresh
+        self.rec_use_src_interest = args.rec_use_src_interest
         # 双分支信任记忆：src 用于 memory=rec2src / tgt=src2src，rec 用于 memory=src2rec / tgt=rec2rec
         self.src_memory_trust_memory = SlowTrustMemory(dim=self.item_size,
                                                        epsilon=self.memory_eps,
@@ -326,6 +335,17 @@ class UniSAR(BaseModel):
             rec_mem_write)
         rec_memory_trust_bias, _ = self.rec_memory_trust_memory(
             rec_mem_write, rec_pad_mask, update_mask=rec_has_click)
+        # Prioritize rec2rec; only trust src2rec when similarity is very confident
+        # Boost target-side (rec2rec) gate slightly
+        rec_tgt_trust_bias = torch.clamp(rec_tgt_trust_bias * self.rec_tgt_boost,
+                                         min=self.gate_floor,
+                                         max=self.rec_tgt_trust_memory.clamp_max)
+        # Suppress memory-side (src2rec) gate unless confidence high
+        high_conf_mask = src2rec_sim > self.src2rec_conf_thresh
+        safe_floor = self.gate_floor
+        rec_memory_trust_bias = torch.where(
+            high_conf_mask, rec_memory_trust_bias,
+            rec_memory_trust_bias.new_full(rec_memory_trust_bias.shape, safe_floor))
 
         src_memory_trust_bias = None
         src_tgt_trust_bias = None
@@ -453,6 +473,12 @@ class UniSAR(BaseModel):
 
         if domain == "rec":
             item_emb = item_emb.reshape(-1, item_emb.size(-1))
+
+            # 控制搜索兴趣对推荐的影响：可选择完全去除或仅阻断梯度
+            if self.rec_use_src_interest:
+                src_interest = src_interest.detach()
+            else:
+                src_interest = torch.zeros_like(src_interest)
 
             concat = torch.cat([
                 rec_interest, src_interest, item_emb, user_emb,

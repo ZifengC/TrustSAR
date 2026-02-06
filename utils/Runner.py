@@ -214,6 +214,7 @@ class BaseRunner(object):
         model.eval()
         predictions = list()
         sim_list = list() if return_sim else None
+        type_list = list() if return_sim else None
         hit_info = [] if return_hits else None
 
         start = time.time()
@@ -222,8 +223,9 @@ class BaseRunner(object):
             prediction = model.predict(batch_gpu)
             predictions.extend(prediction.cpu().data.numpy())
             if return_sim:
-                sims = BaseRunner.compute_query_last_sim(model, batch_gpu)
+                sims, last_types = BaseRunner.compute_query_last_sim(model, batch_gpu)
                 sim_list.extend(sims.cpu().numpy().tolist())
+                type_list.extend(last_types.cpu().numpy().tolist())
             if return_hits and batch_gpu.get('search', False):
                 scores = prediction
                 if not torch.is_tensor(scores):
@@ -251,18 +253,23 @@ class BaseRunner(object):
         predictions = np.array(predictions)
 
         sims_arr = np.array(sim_list) if return_sim else None
+        types_arr = np.array(type_list) if return_sim else None
         if return_sim or return_hits:
-            return predictions, sims_arr, hit_info
+            return predictions, sims_arr, types_arr, hit_info
         return predictions
 
     @staticmethod
     @torch.no_grad()
-    def compute_query_last_sim(model: BaseModel, batch: dict) -> torch.Tensor:
+    def compute_query_last_sim(model: BaseModel, batch: dict) -> (torch.Tensor, torch.Tensor):
         """
-        仅用于搜索数据：计算当前 query 与最近一次交互（search 用 query，rec 用 item）的余弦相似度。
+        仅用于搜索数据：计算当前 query 与最近一次“不相同”的历史交互（可为搜索或推荐）的余弦相似度。
+        - 先看最近一次历史；若是 query 且与当前相同则继续往前找。
+        - 按混合序列从后往前逐个检查，找到第一个与当前 query 不同的历史项（query 或 rec item）。
+        - 找不到则相似度为 0。
         """
         if 'query' not in batch or 'all_his' not in batch or 'all_his_type' not in batch:
-            return torch.zeros((batch['batch_size'], ), device=model.device)
+            zeros = torch.zeros((batch['batch_size'], ), device=model.device)
+            return zeros, torch.zeros_like(zeros)
 
         query_emb = model.session_embedding.get_query_emb(batch['query'])
         all_his = batch['all_his']
@@ -274,33 +281,51 @@ class BaseRunner(object):
         else:
             valid_mask = all_his != 0
 
-        valid_lens = valid_mask.sum(dim=1)
-        last_idx = (valid_lens - 1).clamp(min=0)
-        batch_indices = torch.arange(all_his.size(0), device=all_his.device)
-        last_item = all_his[batch_indices, last_idx]
-        last_type = all_his_type[batch_indices, last_idx]
+        keyword_map = model.session_embedding.map_vocab['keyword'].to(
+            model.device)
 
-        last_emb = torch.zeros_like(query_emb)
-        rec_mask = last_type == 1
-        if rec_mask.any():
-            rec_ids = last_item[rec_mask]
-            rec_emb = model.session_embedding.get_item_emb(rec_ids)
-            last_emb[rec_mask] = rec_emb
+        batch_size = all_his.size(0)
+        sims = torch.zeros((batch_size, ), device=model.device)
+        last_types = torch.zeros((batch_size, ), device=model.device)  # 0: none, 1: rec item, 2: query
 
-        src_mask = last_type == 2
-        if src_mask.any():
-            src_ids = last_item[src_mask].long()
-            keyword_map = model.session_embedding.map_vocab['keyword'].to(
-                model.device)
-            src_query_tokens = keyword_map[src_ids]
-            src_query_emb = model.session_embedding.get_query_emb(
-                src_query_tokens)
-            last_emb[src_mask] = src_query_emb
+        # 遍历每个样本，找到最近一个与当前 query 不同的历史交互（query/rec）
+        for i in range(batch_size):
+            valid_indices = torch.nonzero(valid_mask[i], as_tuple=False).squeeze(-1)
+            if valid_indices.numel() == 0:
+                continue
 
-        sims = torch.nn.functional.cosine_similarity(query_emb,
-                                                     last_emb,
-                                                     dim=-1)
-        return sims
+            current_query_tokens = batch['query'][i]
+
+            # 从最近到最远检查混合历史序列
+            for idx in reversed(valid_indices.tolist()):
+                h_type = all_his_type[i, idx]
+
+                # 历史查询
+                if h_type == 2:
+                    hist_query_id = all_his[i, idx].long()
+                    hist_query_tokens = keyword_map[hist_query_id]
+
+                    # 与当前 query 完全相同时跳过
+                    if torch.equal(hist_query_tokens, current_query_tokens):
+                        continue
+
+                    hist_emb = model.session_embedding.get_query_emb(
+                        hist_query_tokens.unsqueeze(0)).squeeze(0)
+                # 历史推荐 item
+                elif h_type == 1:
+                    hist_item_id = all_his[i, idx].unsqueeze(0)
+                    hist_emb = model.session_embedding.get_item_emb(
+                        hist_item_id).squeeze(0)
+                else:
+                    # 未知类型，忽略
+                    continue
+
+                sims[i] = torch.nn.functional.cosine_similarity(
+                    query_emb[i], hist_emb, dim=-1)
+                last_types[i] = h_type
+                break
+
+        return sims, last_types
 
     def evaluate(self, model: BaseModel, mode: str):
         raise NotImplementedError
@@ -452,13 +477,14 @@ class SarRunner(BaseRunner):
     def evaluate(self, model: BaseModel, mode: str):
         if mode == 'val':
             rec_predictions = self.predict(model, self.rec_val_loader)
-            src_predictions, src_sims, _ = self.predict(model,
-                                                        self.src_val_loader,
-                                                        return_sim=True,
-                                                        return_hits=False)
+            src_predictions, src_sims, src_last_types, _ = self.predict(
+                model,
+                self.src_val_loader,
+                return_sim=True,
+                return_hits=False)
         elif mode == 'test':
             rec_predictions = self.predict(model, self.rec_test_loader)
-            src_predictions, src_sims, hit_info = self.predict(
+            src_predictions, src_sims, src_last_types, hit_info = self.predict(
                 model,
                 self.src_test_loader,
                 return_sim=True,
@@ -481,20 +507,29 @@ class SarRunner(BaseRunner):
                 logging.info(f"user={h['user']} item={h['item']} query={h['query']}")
 
         if src_sims is not None and len(src_sims) > 0:
-            # 按相似度分为 bottom 10%、mid 80%、top 10%
-            quantiles = np.quantile(src_sims, [0.1, 0.9])
-            buckets = [
-                src_sims <= quantiles[0],  # bottom 10%
-                (src_sims > quantiles[0]) & (src_sims <= quantiles[1]),  # mid 80%
-                src_sims > quantiles[1]  # top 10%
-            ]
-            bucket_keys = ['bottom10', 'mid80', 'top10']
-            for mask, bkey in zip(buckets, bucket_keys):
-                if mask.sum() == 0:
+            # 按最后不同交互的类型拆分：查询 vs 推荐
+            for last_type, type_key in [(2, 'last_query'), (1, 'last_rec')]:
+                type_mask = src_last_types == last_type
+                if type_mask.sum() == 0:
                     continue
-                bucket_eval = self.evaluate_method(
-                    src_predictions[mask], self.topk, self.metrics)
-                results[f"src_{bkey}"] = utils.format_metric(bucket_eval)
+
+                sims_group = src_sims[type_mask]
+                preds_group = src_predictions[type_mask]
+
+                # 按相似度分为 bottom 10%、mid 80%、top 10%
+                quantiles = np.quantile(sims_group, [0.1, 0.9])
+                buckets = [
+                    sims_group <= quantiles[0],  # bottom 10%
+                    (sims_group > quantiles[0]) & (sims_group <= quantiles[1]),  # mid 80%
+                    sims_group > quantiles[1]  # top 10%
+                ]
+                bucket_keys = ['bottom10', 'mid80', 'top10']
+                for mask, bkey in zip(buckets, bucket_keys):
+                    if mask.sum() == 0:
+                        continue
+                    bucket_eval = self.evaluate_method(
+                        preds_group[mask], self.topk, self.metrics)
+                    results[f"src_{type_key}_{bkey}"] = utils.format_metric(bucket_eval)
 
         return results, (rec_results[self.main_metric] +
                          src_results[self.main_metric]) / 2.0

@@ -20,3 +20,8 @@ his_cl_weight: 0.1
 pred_hid_units: [200, 80, 1]
 
 src_loss_weight: 0.1 # weight for the loss of search
+
+# gating hyperparams
+rec_tgt_boost: 1.2
+src2rec_conf_thresh: 0.9
+rec_use_src_interest: false
