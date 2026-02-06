@@ -39,6 +39,8 @@ class UniSAR(BaseModel):
                             help='Confidence threshold for trusting src2rec gate')
         parser.add_argument('--rec_use_src_interest', action='store_true',
                             help='Whether to feed src_interest into rec prediction branch')
+        parser.add_argument('--src_use_rec_interest', action='store_true',
+                            help='Whether to feed rec_interest into src prediction branch')
 
         return BaseModel.parse_model_args(parser)
 
@@ -145,6 +147,7 @@ class UniSAR(BaseModel):
         self.rec_tgt_boost = args.rec_tgt_boost
         self.src2rec_conf_thresh = args.src2rec_conf_thresh
         self.rec_use_src_interest = args.rec_use_src_interest
+        self.src_use_rec_interest = args.src_use_rec_interest
         # 双分支信任记忆：src 用于 memory=rec2src / tgt=src2src，rec 用于 memory=src2rec / tgt=rec2rec
         self.src_memory_trust_memory = SlowTrustMemory(dim=self.item_size,
                                                        epsilon=self.memory_eps,
@@ -493,6 +496,12 @@ class UniSAR(BaseModel):
         elif domain == "src":
             if item_emb.dim() == 3:
                 [query_emb], item_emb = self.repeat_feat([query_emb], item_emb)
+
+            # 控制推荐兴趣对搜索的影响：可选择完全去除或仅阻断梯度
+            if self.src_use_rec_interest:
+                rec_interest = rec_interest.detach()
+            else:
+                rec_interest = torch.zeros_like(rec_interest)
 
             concat = torch.cat(
                 [rec_interest, src_interest, item_emb, user_emb, query_emb], -1)
