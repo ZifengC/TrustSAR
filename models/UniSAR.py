@@ -106,6 +106,9 @@ class UniSAR(BaseModel):
         self.src_cross_fusion = MemoryTransformerDecoder(
             self.src_decoder_layer, num_layers=self.num_layers)
 
+        # Learnable mix between pure rec path and src->rec cross fusion
+        self.rec_src_mix = nn.Parameter(torch.tensor(0.5))
+
         self.rec_his_attn_pooling = Target_Attention(self.item_size,
                                                      self.item_size)
         self.src_his_attn_pooling = Target_Attention(self.item_size,
@@ -408,13 +411,18 @@ class UniSAR(BaseModel):
         rec2rec_pad = (rec2rec.abs().sum(dim=-1) == 0)
         src2src_pad = (src2src.abs().sum(dim=-1) == 0)
 
-        rec_fusion_decoded = self.rec_cross_fusion(
+        # Cross path: src -> rec
+        rec_cross = self.rec_cross_fusion(
             tgt=rec2rec,
             memory=src2rec,
             tgt_key_padding_mask=rec_pad_mask,
             memory_key_padding_mask=self.match_mask_to_tensor(src2rec_pad, src2rec),
             memory_scale=rec_memory_trust_bias,
             tgt_scale=rec_tgt_trust_bias)
+        # Self path: pure rec history (no cross) to avoid competition
+        rec_self = rec2rec
+        mix = torch.sigmoid(self.rec_src_mix)
+        rec_fusion_decoded = mix * rec_cross + (1 - mix) * rec_self
         self._check_finite("rec_fusion_decoded", rec_fusion_decoded)
 
         src_fusion_decoded = self.src_cross_fusion(
@@ -476,7 +484,7 @@ class UniSAR(BaseModel):
 
             # 控制搜索兴趣对推荐的影响：可选择完全去除或仅阻断梯度
             if self.rec_use_src_interest:
-                src_interest = src_interest.detach()
+                src_interest = src_interest
             else:
                 src_interest = torch.zeros_like(src_interest)
 
