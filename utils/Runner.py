@@ -501,11 +501,6 @@ class SarRunner(BaseRunner):
             "rec": utils.format_metric(rec_results),
             "src": utils.format_metric(src_results)
         }
-        if mode == 'test' and 'hit_info' in locals() and hit_info:
-            logging.info("Sample search hits (top1 correct) [max 20]:")
-            for h in hit_info:
-                logging.info(f"user={h['user']} item={h['item']} query={h['query']}")
-
         if src_sims is not None and len(src_sims) > 0:
             # 按最后不同交互的类型拆分：查询 vs 推荐
             for last_type, type_key in [(2, 'last_query'), (1, 'last_rec')]:
