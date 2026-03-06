@@ -20,3 +20,8 @@ his_cl_weight: 0.01
 pred_hid_units: [200, 80, 1]
 
 src_loss_weight: 0.01 # weight for the loss of search
+intent_num: 4
+intent_heads: 2
+intent_temp: 1.0
+intent_dropout: 0.1
+transition_dynamic_hidden: 64

@@ -33,6 +33,11 @@ class UniSAR(BaseModel):
         parser.add_argument('--memory_log_interval', type=int, default=200)
         parser.add_argument('--rec_use_src_interest', action='store_true',
                             help='Whether to feed src_interest into rec prediction branch')
+        parser.add_argument('--intent_num', type=int, default=4)
+        parser.add_argument('--intent_heads', type=int, default=2)
+        parser.add_argument('--intent_temp', type=float, default=1.0)
+        parser.add_argument('--intent_dropout', type=float, default=0.1)
+        parser.add_argument('--transition_dynamic_hidden', type=int, default=64)
 
         return BaseModel.parse_model_args(parser)
 
@@ -139,6 +144,8 @@ class UniSAR(BaseModel):
         self.loss_fn = nn.BCELoss()
         self.memory_eps = args.memory_eps
         self.rec_use_src_interest = args.rec_use_src_interest
+        self.intent_num = args.intent_num
+        self.intent_temp = args.intent_temp
         # 双分支信任记忆：src 用于 memory=rec2src / tgt=src2src，rec 用于 memory=src2rec / tgt=rec2rec
         self.src_memory_trust_memory = TrustMemory(dim=self.item_size,
                                                        epsilon=self.memory_eps,
@@ -156,6 +163,20 @@ class UniSAR(BaseModel):
                                                     epsilon=self.memory_eps,
                                                     clamp_min=args.memory_bias_min,
                                                     clamp_max=args.memory_bias_max)
+        self.rec_intent_discovery = LatentIntentDiscovery(
+            emb_dim=self.item_size,
+            num_intents=self.intent_num,
+            num_heads=args.intent_heads,
+            dropout=args.intent_dropout)
+        self.src_intent_discovery = LatentIntentDiscovery(
+            emb_dim=self.item_size,
+            num_intents=self.intent_num,
+            num_heads=args.intent_heads,
+            dropout=args.intent_dropout)
+        self.intent_transition_graph = IntentTransitionGraph(
+            emb_dim=self.item_size,
+            num_intents=self.intent_num,
+            hidden_dim=args.transition_dynamic_hidden)
         self.memory_log = args.memory_log
         self.memory_log_interval = args.memory_log_interval
         self._memory_log_counter = 0
@@ -268,6 +289,67 @@ class UniSAR(BaseModel):
         denom = a.norm(dim=-1) * b.norm(dim=-1) + eps
         return numer / denom
 
+    def _intent_soft_assign(self,
+                            behavior: torch.Tensor,
+                            intents: torch.Tensor,
+                            pad_mask: torch.Tensor = None):
+        logits = torch.einsum("btd,bkd->btk", behavior, intents)
+        logits = logits / (behavior.size(-1) ** 0.5 * max(self.intent_temp, 1e-6))
+        assign = torch.softmax(logits, dim=-1)
+        if pad_mask is not None:
+            assign = assign.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        return assign
+
+    def _current_item_anchor(self, items_emb: torch.Tensor):
+        if items_emb.dim() == 3:
+            # Use the first candidate as current anchor (positive item during training/eval pipeline).
+            return items_emb[:, 0, :]
+        return items_emb
+
+    def _intent_routing_bias(self,
+                             transition: torch.Tensor,
+                             current_item: torch.Tensor,
+                             src_intents: torch.Tensor,
+                             tgt_intents: torch.Tensor,
+                             src_to_tgt_probs: torch.Tensor,
+                             pad_mask: torch.Tensor,
+                             update_mask: torch.Tensor,
+                             memory_module):
+        valid_mask = (~pad_mask)
+        if update_mask is not None:
+            valid_mask = valid_mask & update_mask
+
+        # Semantic confidence of each transition step under current candidate item.
+        alpha_abs = torch.abs((transition * current_item.unsqueeze(1)).sum(dim=-1))
+        alpha_conf = torch.tanh(alpha_abs).masked_fill(~valid_mask, 0.0)
+
+        item_tgt_logits = torch.einsum("bd,bkd->bk", current_item, tgt_intents)
+        item_tgt_logits = item_tgt_logits / (current_item.size(-1) ** 0.5 * max(self.intent_temp, 1e-6))
+        item_tgt_assign = torch.softmax(item_tgt_logits, dim=-1)
+        src_demand = torch.einsum("bk,bmk->bm", item_tgt_assign, src_to_tgt_probs.transpose(1, 2))
+        mem_src_assign = self._intent_soft_assign(transition, src_intents, pad_mask=pad_mask)
+
+        route_match = (src_demand.unsqueeze(1) * mem_src_assign).sum(dim=-1)
+        route_match = route_match.masked_fill(~valid_mask, 0.0)
+
+        src_reliability_per_intent = src_to_tgt_probs.max(dim=-1).values
+        src_reliability = (mem_src_assign * src_reliability_per_intent.unsqueeze(1)).sum(dim=-1)
+        src_reliability = src_reliability.masked_fill(~valid_mask, 0.0)
+
+        confidence = alpha_conf * route_match * src_reliability
+        confidence = confidence.masked_fill(pad_mask, 0.0)
+        confidence = confidence.clamp(min=0.0, max=1.0)
+
+        trust_bias = memory_module.clamp_min + \
+            (memory_module.clamp_max - memory_module.clamp_min) * confidence
+        neutral_mask = (~pad_mask) & (~valid_mask)
+        trust_bias = trust_bias.masked_fill(neutral_mask, 1.0)
+        trust_bias = trust_bias.masked_fill(pad_mask, 1.0)
+        trust_bias = torch.clamp(trust_bias,
+                                 min=memory_module.clamp_min,
+                                 max=memory_module.clamp_max)
+        return trust_bias
+
     def _transition_confidence_bias(self,
                                     transition: torch.Tensor,
                                     item_anchor: torch.Tensor,
@@ -318,6 +400,8 @@ class UniSAR(BaseModel):
     def forward(self, user, all_his, all_his_type, items_emb, domain):
         user_emb = self.session_embedding.get_user_emb(user)
         self._check_finite("user_emb_raw", user_emb)
+        current_item = self._current_item_anchor(items_emb)
+        self._check_finite("current_item_anchor", current_item)
 
         all_his_emb, all_his_mask, q_i_align_used = self.get_all_his_emb(
             all_his, all_his_type)
@@ -354,6 +438,12 @@ class UniSAR(BaseModel):
         self._check_finite("rec2rec", rec2rec)
         self._check_finite("src2src", src2src)
 
+        rec_intents = self.rec_intent_discovery(rec2rec, rec_pad_mask)
+        src_intents = self.src_intent_discovery(src2src, src_pad_mask)
+        r2s_probs, s2r_probs = self.intent_transition_graph(rec_intents, src_intents)
+        src_source_available = (~src_pad_mask).any(dim=1, keepdim=True).expand_as(rec_pad_mask)
+        rec_source_available = (~rec_pad_mask).any(dim=1, keepdim=True).expand_as(src_pad_mask)
+
         # rec 分支 confidence gate：alpha强度 + 路径归属 + 路径稳定性
         rec_has_click = ~rec_pad_mask
         rec_tgt_trust_bias, _ = self._transition_confidence_bias(
@@ -363,53 +453,55 @@ class UniSAR(BaseModel):
             update_mask=rec_has_click,
             memory_module=self.rec_tgt_trust_memory)
 
-        rec_memory_trust_bias, _ = self._transition_confidence_bias(
+        rec_memory_trust_bias = self._intent_routing_bias(
             transition=src2rec,
-            item_anchor=rec_his_emb,
+            current_item=current_item,
+            src_intents=src_intents,
+            tgt_intents=rec_intents,
+            src_to_tgt_probs=s2r_probs,
             pad_mask=rec_pad_mask,
-            update_mask=rec_has_click,
+            update_mask=src_source_available,
             memory_module=self.rec_memory_trust_memory)
 
-        src_memory_trust_bias = None
-        src_tgt_trust_bias = None
-        memory_state = None
-        self._last_trust_bias = None
-        if domain == 'src':
-            query_emb, click_item_mask, q_click_item_emb = q_i_align_used
-            click_item_sum = torch.sum(q_click_item_emb *
-                                       click_item_mask.unsqueeze(-1),
-                                       dim=-2)
-            click_count = click_item_mask.sum(-1,
-                                              keepdim=True).clamp(min=1.0)
-            mean_click_item_emb = click_item_sum / click_count
-            has_click = click_item_mask.sum(-1) > 0
+        query_emb, click_item_mask, q_click_item_emb = q_i_align_used
+        click_item_sum = torch.sum(q_click_item_emb *
+                                   click_item_mask.unsqueeze(-1),
+                                   dim=-2)
+        click_count = click_item_mask.sum(-1,
+                                          keepdim=True).clamp(min=1.0)
+        mean_click_item_emb = click_item_sum / click_count
+        has_click = click_item_mask.sum(-1) > 0
 
-            src_selector = (all_his_type == 2)
-            src_len = src2src.size(1)
-            src_mean_click = torch.masked_select(
-                mean_click_item_emb, src_selector.unsqueeze(-1)).reshape(
-                    (mean_click_item_emb.size(0), src_len,
-                     mean_click_item_emb.size(-1)))
-            src_has_click = torch.masked_select(has_click,
-                                                src_selector).reshape(
-                                                    (has_click.size(0),
-                                                     src_len))
-            # src 分支 memory gate：统一 confidence（三因子）
-            src_memory_trust_bias, memory_state = self._transition_confidence_bias(
-                transition=rec2src,
-                item_anchor=src_mean_click,
-                pad_mask=src_pad_mask,
-                update_mask=src_has_click,
-                memory_module=self.src_memory_trust_memory)
-            self._last_trust_bias = src_memory_trust_bias
+        src_selector = (all_his_type == 2)
+        src_len = src2src.size(1)
+        src_mean_click = torch.masked_select(
+            mean_click_item_emb, src_selector.unsqueeze(-1)).reshape(
+                (mean_click_item_emb.size(0), src_len,
+                 mean_click_item_emb.size(-1)))
+        src_has_click = torch.masked_select(has_click,
+                                            src_selector).reshape(
+                                                (has_click.size(0),
+                                                 src_len))
+        # src 分支 memory gate：统一 confidence（三因子）
+        src_memory_trust_bias = self._intent_routing_bias(
+            transition=rec2src,
+            current_item=current_item,
+            src_intents=rec_intents,
+            tgt_intents=src_intents,
+            src_to_tgt_probs=r2s_probs,
+            pad_mask=src_pad_mask,
+            update_mask=rec_source_available,
+            memory_module=self.src_memory_trust_memory)
+        memory_state = rec2src.masked_fill(src_pad_mask.unsqueeze(-1), 0.0).mean(dim=1)
+        self._last_trust_bias = src_memory_trust_bias
 
-            # src 分支 tgt gate：统一 confidence（三因子）
-            src_tgt_trust_bias, _ = self._transition_confidence_bias(
-                transition=src2src,
-                item_anchor=src_mean_click,
-                pad_mask=src_pad_mask,
-                update_mask=src_has_click,
-                memory_module=self.src_tgt_trust_memory)
+        # src 分支 tgt gate：统一 confidence（三因子）
+        src_tgt_trust_bias, _ = self._transition_confidence_bias(
+            transition=src2src,
+            item_anchor=src_mean_click,
+            pad_mask=src_pad_mask,
+            update_mask=src_has_click,
+            memory_module=self.src_tgt_trust_memory)
 
         src2rec_pad = (src2rec.abs().sum(dim=-1) == 0)
         rec2src_pad = (rec2src.abs().sum(dim=-1) == 0)
@@ -769,6 +861,71 @@ class TransAlign(nn.Module):
         info_nce_loss = self.cl_loss_func(logits, labels)
 
         return info_nce_loss
+
+
+class LatentIntentDiscovery(nn.Module):
+    def __init__(self,
+                 emb_dim: int,
+                 num_intents: int,
+                 num_heads: int = 2,
+                 dropout: float = 0.1):
+        super().__init__()
+        if emb_dim % num_heads != 0:
+            num_heads = 1
+        self.intent_slots = nn.Parameter(torch.randn(num_intents, emb_dim))
+        nn.init.xavier_normal_(self.intent_slots)
+        self.slot_attention = nn.MultiheadAttention(embed_dim=emb_dim,
+                                                    num_heads=num_heads,
+                                                    dropout=dropout,
+                                                    batch_first=True)
+        self.norm = nn.LayerNorm(emb_dim)
+
+    def forward(self, behavior_seq: torch.Tensor, pad_mask: torch.Tensor):
+        batch_size = behavior_seq.size(0)
+        slots = self.intent_slots.unsqueeze(0).expand(batch_size, -1, -1)
+        intents, _ = self.slot_attention(query=slots,
+                                         key=behavior_seq,
+                                         value=behavior_seq,
+                                         key_padding_mask=pad_mask)
+        intents = self.norm(intents + slots)
+        return intents
+
+
+class IntentTransitionGraph(nn.Module):
+    def __init__(self,
+                 emb_dim: int,
+                 num_intents: int,
+                 hidden_dim: int = 64):
+        super().__init__()
+        self.num_intents = num_intents
+        self.r2s_global = nn.Parameter(torch.zeros(num_intents, num_intents))
+        self.s2r_global = nn.Parameter(torch.zeros(num_intents, num_intents))
+        self.r2s_dynamic = nn.Sequential(nn.Linear(2 * emb_dim, hidden_dim),
+                                         nn.ReLU(),
+                                         nn.Linear(hidden_dim,
+                                                   num_intents * num_intents))
+        self.s2r_dynamic = nn.Sequential(nn.Linear(2 * emb_dim, hidden_dim),
+                                         nn.ReLU(),
+                                         nn.Linear(hidden_dim,
+                                                   num_intents * num_intents))
+
+    def forward(self, rec_intents: torch.Tensor, src_intents: torch.Tensor):
+        rec_summary = rec_intents.mean(dim=1)
+        src_summary = src_intents.mean(dim=1)
+        user_ctx = torch.cat([rec_summary, src_summary], dim=-1)
+
+        r2s_delta = self.r2s_dynamic(user_ctx).reshape(-1,
+                                                       self.num_intents,
+                                                       self.num_intents)
+        s2r_delta = self.s2r_dynamic(user_ctx).reshape(-1,
+                                                       self.num_intents,
+                                                       self.num_intents)
+
+        r2s_logits = self.r2s_global.unsqueeze(0) + r2s_delta
+        s2r_logits = self.s2r_global.unsqueeze(0) + s2r_delta
+        r2s_probs = torch.softmax(r2s_logits, dim=-1)
+        s2r_probs = torch.softmax(s2r_logits, dim=-1)
+        return r2s_probs, s2r_probs
 
 
 class TrustMemory(nn.Module):

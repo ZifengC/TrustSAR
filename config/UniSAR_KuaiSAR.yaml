@@ -5,8 +5,8 @@ min_lr: 0.000001
 l2: 0.00003
 
 epoch: 100
-patience: 3
-early_stop: 5
+patience: 5
+early_stop: 20
 
 num_layers: 1
 num_heads: 2
@@ -22,3 +22,9 @@ pred_hid_units: [200, 80, 1]
 src_loss_weight: 0.1 # weight for the loss of search
 
 rec_use_src_interest: false
+
+intent_num: 4
+intent_heads: 2
+intent_temp: 1.0
+intent_dropout: 0.1
+transition_dynamic_hidden: 64
