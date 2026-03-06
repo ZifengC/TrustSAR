@@ -31,12 +31,6 @@ class UniSAR(BaseModel):
         parser.add_argument('--memory_bias_max', type=float, default=1.2)
         parser.add_argument('--memory_log', action='store_true')
         parser.add_argument('--memory_log_interval', type=int, default=200)
-        parser.add_argument('--gate_floor', type=float, default=0.85,
-                            help='Lower bound for gate blending to avoid hard suppression')
-        parser.add_argument('--rec_tgt_boost', type=float, default=1.2,
-                            help='Multiplier for rec2rec trust gate')
-        parser.add_argument('--src2rec_conf_thresh', type=float, default=0.9,
-                            help='Confidence threshold for trusting src2rec gate')
         parser.add_argument('--rec_use_src_interest', action='store_true',
                             help='Whether to feed src_interest into rec prediction branch')
 
@@ -144,24 +138,21 @@ class UniSAR(BaseModel):
 
         self.loss_fn = nn.BCELoss()
         self.memory_eps = args.memory_eps
-        self.gate_floor = args.gate_floor
-        self.rec_tgt_boost = args.rec_tgt_boost
-        self.src2rec_conf_thresh = args.src2rec_conf_thresh
         self.rec_use_src_interest = args.rec_use_src_interest
         # 双分支信任记忆：src 用于 memory=rec2src / tgt=src2src，rec 用于 memory=src2rec / tgt=rec2rec
-        self.src_memory_trust_memory = SlowTrustMemory(dim=self.item_size,
+        self.src_memory_trust_memory = TrustMemory(dim=self.item_size,
                                                        epsilon=self.memory_eps,
                                                        clamp_min=args.memory_bias_min,
                                                        clamp_max=args.memory_bias_max)
-        self.src_tgt_trust_memory = SlowTrustMemory(dim=self.item_size,
+        self.src_tgt_trust_memory = TrustMemory(dim=self.item_size,
                                                     epsilon=self.memory_eps,
                                                     clamp_min=args.memory_bias_min,
                                                     clamp_max=args.memory_bias_max)
-        self.rec_memory_trust_memory = SlowTrustMemory(dim=self.item_size,
+        self.rec_memory_trust_memory = TrustMemory(dim=self.item_size,
                                                        epsilon=self.memory_eps,
                                                        clamp_min=args.memory_bias_min,
                                                        clamp_max=args.memory_bias_max)
-        self.rec_tgt_trust_memory = SlowTrustMemory(dim=self.item_size,
+        self.rec_tgt_trust_memory = TrustMemory(dim=self.item_size,
                                                     epsilon=self.memory_eps,
                                                     clamp_min=args.memory_bias_min,
                                                     clamp_max=args.memory_bias_max)
@@ -272,6 +263,58 @@ class UniSAR(BaseModel):
                  all_his_emb.shape[2]))
         return rec_his_emb, src_his_emb
 
+    def _safe_cosine(self, a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8):
+        numer = (a * b).sum(dim=-1)
+        denom = a.norm(dim=-1) * b.norm(dim=-1) + eps
+        return numer / denom
+
+    def _transition_confidence_bias(self,
+                                    transition: torch.Tensor,
+                                    item_anchor: torch.Tensor,
+                                    pad_mask: torch.Tensor,
+                                    update_mask: torch.Tensor,
+                                    memory_module):
+        valid_mask = (~pad_mask)
+        if update_mask is not None:
+            valid_mask = valid_mask & update_mask
+
+        # Factor 1: absolute alpha strength between current item and transition (no softmax)
+        alpha_abs = torch.abs((transition * item_anchor).sum(dim=-1))
+        alpha_abs = alpha_abs.masked_fill(~valid_mask, 0.0)
+        # Monotonic compression without per-sample normalization.
+        alpha_conf = torch.tanh(alpha_abs)
+
+        write_signal = transition * alpha_conf.unsqueeze(-1)
+        write_signal = torch.where(pad_mask.unsqueeze(-1), torch.zeros_like(write_signal),
+                                   write_signal)
+
+        _, memory_state, memory_trace, stability = memory_module(
+            write_signal,
+            pad_mask,
+            update_mask=update_mask,
+            return_trace=True)
+
+        # Factor 2: path membership confidence (current item belongs to cumulative memory path)
+        path_sim = self._safe_cosine(item_anchor, memory_trace)
+        path_conf = ((path_sim + 1.0) * 0.5).masked_fill(~valid_mask, 0.0)
+
+        # Factor 3: memory/path stability confidence
+        stability = stability.masked_fill(~valid_mask, 0.0)
+
+        confidence = alpha_conf * path_conf * stability
+        confidence = confidence.masked_fill(pad_mask, 0.0)
+
+        trust_bias = memory_module.clamp_min + \
+            (memory_module.clamp_max - memory_module.clamp_min) * confidence
+        # Keep non-updated (no evidence) non-pad steps neutral instead of punitive.
+        neutral_mask = (~pad_mask) & (~valid_mask)
+        trust_bias = trust_bias.masked_fill(neutral_mask, 1.0)
+        trust_bias = trust_bias.masked_fill(pad_mask, 1.0)
+        trust_bias = torch.clamp(trust_bias,
+                                 min=memory_module.clamp_min,
+                                 max=memory_module.clamp_max)
+        return trust_bias, memory_state
+
     def forward(self, user, all_his, all_his_type, items_emb, domain):
         user_emb = self.session_embedding.get_user_emb(user)
         self._check_finite("user_emb_raw", user_emb)
@@ -311,44 +354,21 @@ class UniSAR(BaseModel):
         self._check_finite("rec2rec", rec2rec)
         self._check_finite("src2src", src2src)
 
-        # rec 分支 gate：由 rec2rec / src2rec 与推荐点击序列相似度生成
+        # rec 分支 confidence gate：alpha强度 + 路径归属 + 路径稳定性
         rec_has_click = ~rec_pad_mask
-        rec_sim_numer = (rec2rec * rec_his_emb).sum(dim=-1)
-        rec_sim_denom = rec2rec.norm(dim=-1) * rec_his_emb.norm(dim=-1) + 1e-8
-        rec_sim = rec_sim_numer / rec_sim_denom
-        rec_sim = rec_sim.masked_fill(~rec_has_click, 0.0)
+        rec_tgt_trust_bias, _ = self._transition_confidence_bias(
+            transition=rec2rec,
+            item_anchor=rec_his_emb,
+            pad_mask=rec_pad_mask,
+            update_mask=rec_has_click,
+            memory_module=self.rec_tgt_trust_memory)
 
-        rec_tgt_write = rec2rec * rec_sim.unsqueeze(-1)
-        rec_tgt_write = torch.where(
-            rec_pad_mask.unsqueeze(-1),
-            torch.zeros_like(rec_tgt_write),
-            rec_tgt_write)
-        rec_tgt_trust_bias, _ = self.rec_tgt_trust_memory(
-            rec_tgt_write, rec_pad_mask, update_mask=rec_has_click)
-
-        src2rec_sim_numer = (src2rec * rec_his_emb).sum(dim=-1)
-        src2rec_sim_denom = src2rec.norm(dim=-1) * rec_his_emb.norm(dim=-1) + 1e-8
-        src2rec_sim = src2rec_sim_numer / src2rec_sim_denom
-        src2rec_sim = src2rec_sim.masked_fill(~rec_has_click, 0.0)
-
-        rec_mem_write = src2rec * src2rec_sim.unsqueeze(-1)
-        rec_mem_write = torch.where(
-            rec_pad_mask.unsqueeze(-1),
-            torch.zeros_like(rec_mem_write),
-            rec_mem_write)
-        rec_memory_trust_bias, _ = self.rec_memory_trust_memory(
-            rec_mem_write, rec_pad_mask, update_mask=rec_has_click)
-        # Prioritize rec2rec; only trust src2rec when similarity is very confident
-        # Boost target-side (rec2rec) gate slightly
-        rec_tgt_trust_bias = torch.clamp(rec_tgt_trust_bias * self.rec_tgt_boost,
-                                         min=self.gate_floor,
-                                         max=self.rec_tgt_trust_memory.clamp_max)
-        # Suppress memory-side (src2rec) gate unless confidence high
-        high_conf_mask = src2rec_sim > self.src2rec_conf_thresh
-        safe_floor = self.gate_floor
-        rec_memory_trust_bias = torch.where(
-            high_conf_mask, rec_memory_trust_bias,
-            rec_memory_trust_bias.new_full(rec_memory_trust_bias.shape, safe_floor))
+        rec_memory_trust_bias, _ = self._transition_confidence_bias(
+            transition=src2rec,
+            item_anchor=rec_his_emb,
+            pad_mask=rec_pad_mask,
+            update_mask=rec_has_click,
+            memory_module=self.rec_memory_trust_memory)
 
         src_memory_trust_bias = None
         src_tgt_trust_bias = None
@@ -374,37 +394,22 @@ class UniSAR(BaseModel):
                                                 src_selector).reshape(
                                                     (has_click.size(0),
                                                      src_len))
-            # src 分支 memory gate：rec2src 与搜索点击均值一致性
-            sim_numer = (rec2src * src_mean_click).sum(dim=-1)
-            sim_denom = rec2src.norm(dim=-1) * src_mean_click.norm(dim=-1) + 1e-8
-            sim = sim_numer / sim_denom
-            sim = sim.masked_fill(~src_has_click, 0.0)
-
-            write_signal = rec2src * sim.unsqueeze(-1)
-            write_signal = torch.where(
-                src_pad_mask.unsqueeze(-1),
-                torch.zeros_like(write_signal),
-                write_signal)
-
-            src_memory_trust_bias, memory_state = self.src_memory_trust_memory(write_signal,
-                                                                               src_pad_mask,
-                                                                               update_mask=src_has_click)
+            # src 分支 memory gate：统一 confidence（三因子）
+            src_memory_trust_bias, memory_state = self._transition_confidence_bias(
+                transition=rec2src,
+                item_anchor=src_mean_click,
+                pad_mask=src_pad_mask,
+                update_mask=src_has_click,
+                memory_module=self.src_memory_trust_memory)
             self._last_trust_bias = src_memory_trust_bias
 
-            # src 分支 tgt gate：src2src 与搜索点击均值一致性
-            sim_src_numer = (src2src * src_mean_click).sum(dim=-1)
-            sim_src_denom = src2src.norm(dim=-1) * src_mean_click.norm(dim=-1) + 1e-8
-            sim_src = sim_src_numer / sim_src_denom
-            sim_src = sim_src.masked_fill(~src_has_click, 0.0)
-
-            src_write_signal = src2src * sim_src.unsqueeze(-1)
-            src_write_signal = torch.where(
-                src_pad_mask.unsqueeze(-1),
-                torch.zeros_like(src_write_signal),
-                src_write_signal)
-
-            src_tgt_trust_bias, _ = self.src_tgt_trust_memory(
-                src_write_signal, src_pad_mask, update_mask=src_has_click)
+            # src 分支 tgt gate：统一 confidence（三因子）
+            src_tgt_trust_bias, _ = self._transition_confidence_bias(
+                transition=src2src,
+                item_anchor=src_mean_click,
+                pad_mask=src_pad_mask,
+                update_mask=src_has_click,
+                memory_module=self.src_tgt_trust_memory)
 
         src2rec_pad = (src2rec.abs().sum(dim=-1) == 0)
         rec2src_pad = (rec2src.abs().sum(dim=-1) == 0)
@@ -443,7 +448,6 @@ class UniSAR(BaseModel):
                       f"bias_mean={tb.mean().item():.4f}",
                       f"bias_min={tb.min().item():.4f}",
                       f"bias_max={tb.max().item():.4f}",
-                      f"w_norm={self.src_memory_trust_memory.trust_proj.weight.norm().item():.4f}",
                       f"mem_norm={memory_state.norm(dim=-1).mean().item():.4f}" if memory_state is not None else "")
 
         his_cl_used = [
@@ -767,7 +771,7 @@ class TransAlign(nn.Module):
         return info_nce_loss
 
 
-class SlowTrustMemory(nn.Module):
+class TrustMemory(nn.Module):
     def __init__(self,
                  dim: int,
                  epsilon: float = 0.01,
@@ -777,40 +781,93 @@ class SlowTrustMemory(nn.Module):
         self.epsilon = epsilon
         self.clamp_min = clamp_min
         self.clamp_max = clamp_max
-        self.trust_proj = nn.Linear(dim, 1, bias=False)
-        nn.init.zeros_(self.trust_proj.weight)
+        # Adaptive update rate with learnable base and dynamic factors.
+        self.update_proj = nn.Linear(dim, 1, bias=True)
+        nn.init.zeros_(self.update_proj.weight)
+        nn.init.zeros_(self.update_proj.bias)
+        self.base_mult = nn.Parameter(torch.tensor(20.0))
+        self.dynamic_mult = nn.Parameter(torch.tensor(10.0))
 
     def forward(self,
                 write_signal: torch.Tensor,
                 pad_mask: torch.Tensor,
-                update_mask: torch.Tensor = None):
+                update_mask: torch.Tensor = None,
+                return_trace: bool = False):
         """
         write_signal: (batch, T, dim)
         pad_mask: (batch, T) with True indicating padding
         update_mask: optional (batch, T) bool, True to update at t
         """
         if write_signal.numel() == 0:
-            return write_signal.new_zeros((write_signal.size(0), 0)), None
+            empty_bias = write_signal.new_zeros((write_signal.size(0), 0))
+            if not return_trace:
+                return empty_bias, None
+            empty_trace = write_signal.new_zeros((write_signal.size(0), 0,
+                                                  write_signal.size(-1)))
+            return empty_bias, None, empty_trace, empty_bias
 
-        batch, seq_len, dim = write_signal.shape
-        memory = write_signal.new_zeros((batch, dim))
-        biases = []
-        for t in range(seq_len):
-            update_gate = (~pad_mask[:, t]).float().unsqueeze(-1)
-            if update_mask is not None:
-                update_gate = update_gate * update_mask[:, t].float().unsqueeze(
-                    -1)
-            memory = (1 - self.epsilon * update_gate) * memory + \
-                self.epsilon * write_signal[:, t, :] * update_gate
-            bias = 1 + torch.tanh(self.trust_proj(memory)).squeeze(-1)
-            biases.append(bias)
+        valid_gate = (~pad_mask).float()
+        if update_mask is not None:
+            valid_gate = valid_gate * update_mask.float()
 
-        bias_stack = torch.stack(biases, dim=1)
+        # Adaptive step size (larger than the old fixed epsilon).
+        adaptive_signal = torch.sigmoid(self.update_proj(write_signal)).squeeze(-1)
+        base = F.softplus(self.base_mult)
+        dynamic = F.softplus(self.dynamic_mult)
+        eff_eps = self.epsilon * (base + dynamic * adaptive_signal)
+        eff_eps = torch.clamp(eff_eps, min=1e-6, max=0.95)
+
+        gate = eff_eps * valid_gate
+        a = (1.0 - gate).unsqueeze(-1)  # (B, T, 1)
+        b = gate.unsqueeze(-1) * write_signal  # (B, T, D)
+
+        mem = write_signal.new_zeros((write_signal.size(0), write_signal.size(-1)))
+        traces = []
+        for t in range(write_signal.size(1)):
+            mem = a[:, t, :] * mem + b[:, t, :]
+            traces.append(mem)
+        memory_trace = torch.stack(traces, dim=1)
+        memory = memory_trace[:, -1, :]
+
+        bias_stack = write_signal.new_ones((write_signal.size(0), write_signal.size(1)))
         bias_stack = bias_stack.masked_fill(pad_mask, 1.0)
-        bias_stack = torch.clamp(bias_stack,
-                                 min=self.clamp_min,
-                                 max=self.clamp_max)
-        return bias_stack, memory
+        if not return_trace:
+            return bias_stack, memory
+
+        # Full-path stability: deterministic running accumulation (no cumsum).
+        prev_memory = torch.zeros_like(memory_trace[:, 0, :])
+        run_count = write_signal.new_zeros((write_signal.size(0),))
+        run_sum = write_signal.new_zeros((write_signal.size(0),))
+        run_sum_sq = write_signal.new_zeros((write_signal.size(0),))
+        stability_list = []
+        for t in range(write_signal.size(1)):
+            cur_memory = memory_trace[:, t, :]
+            delta = (cur_memory - prev_memory).norm(dim=-1)
+            base_norm = prev_memory.norm(dim=-1).clamp(min=1e-6)
+            step_ratio = delta / base_norm
+
+            valid_t = valid_gate[:, t]
+            # Do not penalize first effective step of each sample.
+            first_valid_t = (run_count == 0).float() * valid_t
+            step_ratio_eff = torch.where(first_valid_t > 0,
+                                         torch.zeros_like(step_ratio),
+                                         step_ratio)
+            run_count = run_count + valid_t
+            run_sum = run_sum + step_ratio_eff * valid_t
+            run_sum_sq = run_sum_sq + (step_ratio_eff ** 2) * valid_t
+
+            safe_count = run_count.clamp(min=1.0)
+            cum_mean = run_sum / safe_count
+            cum_var = torch.clamp(run_sum_sq / safe_count - cum_mean ** 2,
+                                  min=0.0)
+            cum_std = torch.sqrt(cum_var + 1e-8)
+            stability_t = torch.exp(-(cum_mean + cum_std))
+            stability_list.append(stability_t)
+            prev_memory = cur_memory
+
+        stability_stack = torch.stack(stability_list, dim=1)
+        stability_stack = stability_stack.masked_fill(pad_mask, 1.0)
+        return bias_stack, memory, memory_trace, stability_stack
 
 
 class MemoryTransformerDecoderLayer(nn.Module):
@@ -862,13 +919,12 @@ class MemoryTransformerDecoderLayer(nn.Module):
 
         # Additive attention bias based on trust gates
         attn_bias = None
-        gate_floor = getattr(self, 'gate_floor', 0.85)
         if tgt_scale is not None or memory_scale is not None:
             attn_bias = memory.new_zeros((memory.size(0), tgt.size(1), memory.size(1)))
             if tgt_scale is not None:
-                attn_bias = attn_bias + torch.log(torch.clamp(tgt_scale, min=gate_floor)).unsqueeze(-1)
+                attn_bias = attn_bias + torch.log(torch.clamp(tgt_scale, min=1e-6)).unsqueeze(-1)
             if memory_scale is not None:
-                attn_bias = attn_bias + torch.log(torch.clamp(memory_scale, min=gate_floor)).unsqueeze(-2)
+                attn_bias = attn_bias + torch.log(torch.clamp(memory_scale, min=1e-6)).unsqueeze(-2)
             attn_bias = attn_bias.repeat_interleave(self.multihead_attn.num_heads, dim=0)
 
         tgt2 = self.multihead_attn(tgt,
