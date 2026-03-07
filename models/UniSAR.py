@@ -308,7 +308,7 @@ class UniSAR(BaseModel):
 
     def _intent_routing_bias(self,
                              transition: torch.Tensor,
-                             current_item: torch.Tensor,
+                             position_item: torch.Tensor,
                              src_intents: torch.Tensor,
                              tgt_intents: torch.Tensor,
                              src_to_tgt_probs: torch.Tensor,
@@ -319,17 +319,17 @@ class UniSAR(BaseModel):
         if update_mask is not None:
             valid_mask = valid_mask & update_mask
 
-        # Semantic confidence of each transition step under current candidate item.
-        alpha_abs = torch.abs((transition * current_item.unsqueeze(1)).sum(dim=-1))
+        # Semantic confidence of each transition step under current history position item.
+        alpha_abs = torch.abs((transition * position_item).sum(dim=-1))
         alpha_conf = torch.tanh(alpha_abs).masked_fill(~valid_mask, 0.0)
 
-        item_tgt_logits = torch.einsum("bd,bkd->bk", current_item, tgt_intents)
-        item_tgt_logits = item_tgt_logits / (current_item.size(-1) ** 0.5 * max(self.intent_temp, 1e-6))
+        item_tgt_logits = torch.einsum("btd,bkd->btk", position_item, tgt_intents)
+        item_tgt_logits = item_tgt_logits / (position_item.size(-1) ** 0.5 * max(self.intent_temp, 1e-6))
         item_tgt_assign = torch.softmax(item_tgt_logits, dim=-1)
-        src_demand = torch.einsum("bk,bmk->bm", item_tgt_assign, src_to_tgt_probs.transpose(1, 2))
+        src_demand = torch.einsum("btk,bmk->btm", item_tgt_assign, src_to_tgt_probs.transpose(1, 2))
         mem_src_assign = self._intent_soft_assign(transition, src_intents, pad_mask=pad_mask)
 
-        route_match = (src_demand.unsqueeze(1) * mem_src_assign).sum(dim=-1)
+        route_match = (src_demand * mem_src_assign).sum(dim=-1)
         route_match = route_match.masked_fill(~valid_mask, 0.0)
 
         src_reliability_per_intent = src_to_tgt_probs.max(dim=-1).values
@@ -400,8 +400,6 @@ class UniSAR(BaseModel):
     def forward(self, user, all_his, all_his_type, items_emb, domain):
         user_emb = self.session_embedding.get_user_emb(user)
         self._check_finite("user_emb_raw", user_emb)
-        current_item = self._current_item_anchor(items_emb)
-        self._check_finite("current_item_anchor", current_item)
 
         all_his_emb, all_his_mask, q_i_align_used = self.get_all_his_emb(
             all_his, all_his_type)
@@ -455,7 +453,7 @@ class UniSAR(BaseModel):
 
         rec_memory_trust_bias = self._intent_routing_bias(
             transition=src2rec,
-            current_item=current_item,
+            position_item=rec_his_emb,
             src_intents=src_intents,
             tgt_intents=rec_intents,
             src_to_tgt_probs=s2r_probs,
@@ -485,7 +483,7 @@ class UniSAR(BaseModel):
         # src 分支 memory gate：统一 confidence（三因子）
         src_memory_trust_bias = self._intent_routing_bias(
             transition=rec2src,
-            current_item=current_item,
+            position_item=src_mean_click,
             src_intents=rec_intents,
             tgt_intents=src_intents,
             src_to_tgt_probs=r2s_probs,
