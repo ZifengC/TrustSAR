@@ -1079,15 +1079,58 @@ class MemoryTransformerDecoderLayer(nn.Module):
         if tgt_scale is not None or memory_scale is not None:
             attn_bias = memory.new_zeros((memory.size(0), tgt.size(1), memory.size(1)))
             if tgt_scale is not None:
-                attn_bias = attn_bias + torch.log(torch.clamp(tgt_scale, min=1e-6)).unsqueeze(-1)
+                q_scale = torch.clamp(tgt_scale.detach(), min=1e-6)
+                valid_q_mask = torch.ones_like(q_scale, dtype=torch.bool)
+                if tgt_key_padding_mask is not None:
+                    q_scale = q_scale.masked_fill(tgt_key_padding_mask, 1.0)
+                    valid_q_mask = ~tgt_key_padding_mask
+                attn_bias = attn_bias + torch.log(q_scale).unsqueeze(-1)
             if memory_scale is not None:
-                attn_bias = attn_bias + torch.log(torch.clamp(memory_scale, min=1e-6)).unsqueeze(-2)
+                kv_scale = torch.clamp(memory_scale, min=1e-6)
+                if memory_key_padding_mask is not None:
+                    kv_scale = kv_scale.masked_fill(memory_key_padding_mask, 1.0)
+                if tgt_scale is not None:
+                    # Data-driven uncertainty from target trust: flatter q_scale -> less confidence.
+                    q_min = q_scale.masked_fill(~valid_q_mask, float("inf")).min(dim=1, keepdim=True).values
+                    q_max = q_scale.masked_fill(~valid_q_mask, float("-inf")).max(dim=1, keepdim=True).values
+                    has_valid = valid_q_mask.any(dim=1, keepdim=True)
+                    q_min = torch.where(has_valid, q_min, torch.ones_like(q_min))
+                    q_max = torch.where(has_valid, q_max, torch.ones_like(q_max))
+                    q_range = q_max - q_min
+                    q_norm = (q_scale - q_min) / q_range.clamp(min=1e-6)
+                    rel_uncertainty = 1.0 - q_norm
+                    # For near-constant trust sequences, fallback to absolute trust level.
+                    abs_uncertainty = 1.0 - torch.clamp(q_scale, min=0.0, max=1.0)
+                    q_uncertainty = torch.where(q_range < 1e-6, abs_uncertainty, rel_uncertainty)
+                    if tgt_key_padding_mask is not None:
+                        q_uncertainty = q_uncertainty.masked_fill(tgt_key_padding_mask, 0.0)
+                    kv_eff = 1.0 + q_uncertainty.unsqueeze(-1) * (kv_scale.unsqueeze(-2) - 1.0)
+                    attn_bias = attn_bias + torch.log(torch.clamp(kv_eff, min=1e-6))
+                else:
+                    attn_bias = attn_bias + torch.log(kv_scale).unsqueeze(-2)
             attn_bias = attn_bias.repeat_interleave(self.multihead_attn.num_heads, dim=0)
+
+        merged_memory_mask = memory_mask
+        if attn_bias is not None and memory_mask is not None:
+            if memory_mask.dim() == 2:
+                memory_mask_exp = memory_mask.unsqueeze(0)
+            else:
+                memory_mask_exp = memory_mask
+            if memory_mask_exp.size(0) == 1 and attn_bias.size(0) != 1:
+                memory_mask_exp = memory_mask_exp.expand(attn_bias.size(0), -1, -1)
+            if memory_mask_exp.dtype == torch.bool:
+                mask_bias = torch.zeros_like(attn_bias)
+                mask_bias = mask_bias.masked_fill(memory_mask_exp, float("-inf"))
+            else:
+                mask_bias = memory_mask_exp.to(device=attn_bias.device, dtype=attn_bias.dtype)
+            merged_memory_mask = attn_bias + mask_bias
+        elif attn_bias is not None:
+            merged_memory_mask = attn_bias
 
         tgt2 = self.multihead_attn(tgt,
                                    memory,
                                    memory,
-                                   attn_mask=attn_bias if attn_bias is not None else memory_mask,
+                                   attn_mask=merged_memory_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
