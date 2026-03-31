@@ -8,13 +8,14 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 
-from utils import const
+from utils import const, utils as utils_io
 
 
 class Sampler(object):
     def __init__(self, data_path, search, user_vocab) -> None:
         self.search = search
         self.user_vocab = user_vocab #读用户字典-input1 vocab/user_vocab.pkl
+        self.src_session_num = self._load_src_session_num()
         raw_data = pd.read_pickle(data_path) #读数据表-input2 dataset/rec_train.pkl
         self.virtual_rec_items = self._build_virtual_rec_items(raw_data)
         self.virtual_src_sessions = self._build_virtual_src_sessions(user_vocab)
@@ -110,17 +111,13 @@ class Sampler(object):
         src_his_type = [2] * len(src_his_item)
         src_his = list(zip(src_his_item, src_his_ts, src_his_type))
 
+        self._debug_history_ranges(rec_his_item, src_his_item)
         all_his = rec_his + src_his
 
         sorted_all_his = sorted(all_his, key=lambda x: x[1])
         sorted_all_his_item = [x[0] for x in sorted_all_his]
         sorted_all_his_time = [x[1] for x in sorted_all_his]
         sorted_all_his_type = [x[2] for x in sorted_all_his]
-        # 调试：all_his 范围
-        if sorted_all_his_item:
-            ah_min, ah_max = min(sorted_all_his_item), max(sorted_all_his_item)
-            if ah_min < 0 or ah_max >= const.item_id_num:
-                print(f"[Sampler] all_his item 越界 min={ah_min} max={ah_max}")
 
         return {
             "all_his": [sorted_all_his_item],
@@ -163,6 +160,34 @@ class Sampler(object):
         popular_sessions = [sid for sid, _ in counter.most_common()]
         return popular_sessions
 
+    def _load_src_session_num(self):
+        try:
+            session_map_vocab = utils_io.load_pickle(const.session_map_vocab)
+        except Exception:
+            return None
+        keyword_map = session_map_vocab.get('keyword')
+        if keyword_map is None:
+            return None
+        return int(keyword_map.shape[0])
+
+    def _debug_history_ranges(self, rec_his_item, src_his_item):
+        rec_nonzero = [int(it) for it in rec_his_item if int(it) > 0]
+        if rec_nonzero:
+            rec_min, rec_max = min(rec_nonzero), max(rec_nonzero)
+            if rec_min < 0 or rec_max >= const.item_id_num:
+                print(f"[Sampler] rec_his item 越界 min={rec_min} max={rec_max} "
+                      f"limit={const.item_id_num}")
+
+        if self.src_session_num is None:
+            return
+
+        src_nonzero = [int(it) for it in src_his_item if int(it) > 0]
+        if src_nonzero:
+            src_min, src_max = min(src_nonzero), max(src_nonzero)
+            if src_min < 0 or src_max >= self.src_session_num:
+                print(f"[Sampler] src_session_his 越界 min={src_min} max={src_max} "
+                      f"limit={self.src_session_num}")
+
     def _get_virtual_items(self, num_needed, source):
         if source == 'rec':
             pool = self.virtual_rec_items
@@ -189,4 +214,3 @@ class Sampler(object):
         if len(items) != max_len:
             raise ValueError(f"{source} history length mismatch: {len(items)}/{max_len}")
         return items, ts
-
