@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
+import math
 from typing import List
 
 from utils import const
@@ -38,6 +39,14 @@ class UniSAR(BaseModel):
         parser.add_argument('--intent_temp', type=float, default=1.0)
         parser.add_argument('--intent_dropout', type=float, default=0.1)
         parser.add_argument('--transition_dynamic_hidden', type=int, default=64)
+        parser.add_argument('--intent_diag', action='store_true')
+        parser.add_argument('--intent_diag_interval', type=int, default=200)
+        parser.add_argument('--intent_entropy_floor', type=float, default=0.45)
+        parser.add_argument('--intent_top1_ceiling', type=float, default=0.75)
+        parser.add_argument('--intent_proto_sim_ceiling', type=float, default=0.85)
+        parser.add_argument('--transition_entropy_floor', type=float, default=0.35)
+        parser.add_argument('--transition_peak_ceiling', type=float, default=0.85)
+        parser.add_argument('--transition_cycle_ceiling', type=float, default=0.90)
 
         return BaseModel.parse_model_args(parser)
 
@@ -179,8 +188,18 @@ class UniSAR(BaseModel):
             hidden_dim=args.transition_dynamic_hidden)
         self.memory_log = args.memory_log
         self.memory_log_interval = args.memory_log_interval
+        self.intent_diag = args.intent_diag
+        self.intent_diag_interval = args.intent_diag_interval
+        self.intent_entropy_floor = args.intent_entropy_floor
+        self.intent_top1_ceiling = args.intent_top1_ceiling
+        self.intent_proto_sim_ceiling = args.intent_proto_sim_ceiling
+        self.transition_entropy_floor = args.transition_entropy_floor
+        self.transition_peak_ceiling = args.transition_peak_ceiling
+        self.transition_cycle_ceiling = args.transition_cycle_ceiling
         self._memory_log_counter = 0
         self._last_trust_bias = None
+        self._intent_diag_counter = 0
+        self._last_intent_diag = None
         self._init_weights()
         self.to(self.device)
 
@@ -299,6 +318,114 @@ class UniSAR(BaseModel):
         if pad_mask is not None:
             assign = assign.masked_fill(pad_mask.unsqueeze(-1), 0.0)
         return assign
+
+    def _normalized_entropy(self,
+                            probs: torch.Tensor,
+                            dim: int = -1,
+                            eps: float = 1e-8):
+        probs = probs.clamp_min(eps)
+        entropy = -(probs * probs.log()).sum(dim=dim)
+        support = probs.size(dim)
+        if support <= 1:
+            return torch.zeros_like(entropy)
+        return entropy / math.log(support)
+
+    @torch.no_grad()
+    def _collect_intent_diagnostics(self,
+                                    rec_assign: torch.Tensor,
+                                    src_assign: torch.Tensor,
+                                    rec_intents: torch.Tensor,
+                                    src_intents: torch.Tensor,
+                                    r2s_probs: torch.Tensor,
+                                    s2r_probs: torch.Tensor,
+                                    rec_pad_mask: torch.Tensor,
+                                    src_pad_mask: torch.Tensor):
+        diag = {}
+        valid_groups = [
+            ("rec", rec_assign, rec_intents, rec_pad_mask),
+            ("src", src_assign, src_intents, src_pad_mask)
+        ]
+        for name, assign, intents, pad_mask in valid_groups:
+            valid_mask = (~pad_mask).unsqueeze(-1).float()
+            valid_count = valid_mask.sum().clamp(min=1.0)
+            entropy = self._normalized_entropy(assign, dim=-1)
+            entropy = (entropy * valid_mask.squeeze(-1)).sum() / valid_count
+            top1 = (assign.max(dim=-1).values * valid_mask.squeeze(-1)).sum() / valid_count
+            usage = (assign * valid_mask).sum(dim=(0, 1)) / valid_count
+            proto = F.normalize(intents.mean(dim=0), dim=-1)
+            proto_sim = torch.matmul(proto, proto.transpose(0, 1))
+            proto_mask = ~torch.eye(proto_sim.size(0),
+                                    dtype=torch.bool,
+                                    device=proto_sim.device)
+            if proto_mask.any():
+                proto_sim_mean = proto_sim.masked_select(proto_mask).mean()
+            else:
+                proto_sim_mean = torch.tensor(0.0, device=proto_sim.device)
+            usage_entropy = self._normalized_entropy(usage.unsqueeze(0), dim=-1).squeeze(0)
+            effective = torch.exp(usage_entropy * math.log(max(usage.numel(), 2)))
+            diag[f"{name}_entropy"] = entropy.item()
+            diag[f"{name}_top1"] = top1.item()
+            diag[f"{name}_effective"] = effective.item()
+            diag[f"{name}_usage_peak"] = usage.max().item()
+            diag[f"{name}_proto_sim"] = proto_sim_mean.item()
+            diag[f"{name}_collapse"] = (
+                entropy.item() < self.intent_entropy_floor or
+                top1.item() > self.intent_top1_ceiling or
+                proto_sim_mean.item() > self.intent_proto_sim_ceiling
+            )
+
+        round_trip_groups = [
+            ("rec", torch.bmm(r2s_probs, s2r_probs)),
+            ("src", torch.bmm(s2r_probs, r2s_probs))
+        ]
+        for name, transition in round_trip_groups:
+            row_entropy = self._normalized_entropy(transition, dim=-1).mean()
+            row_peak = transition.max(dim=-1).values.mean()
+            trace_mean = transition.diagonal(dim1=-2, dim2=-1).mean()
+            cycle_gap = (row_peak - trace_mean).clamp(min=0.0)
+            offdiag_mass = (1.0 - trace_mean).clamp(min=0.0, max=1.0)
+            diag[f"{name}_transition_entropy"] = row_entropy.item()
+            diag[f"{name}_transition_peak"] = row_peak.item()
+            diag[f"{name}_transition_trace"] = trace_mean.item()
+            diag[f"{name}_cycle_gap"] = cycle_gap.item()
+            diag[f"{name}_transition_offdiag"] = offdiag_mass.item()
+            diag[f"{name}_non_convergent_risk"] = (
+                row_entropy.item() < self.transition_entropy_floor and
+                offdiag_mass.item() > self.transition_cycle_ceiling
+            )
+            diag[f"{name}_transition_collapse"] = (
+                row_entropy.item() < self.transition_entropy_floor or
+                row_peak.item() > self.transition_peak_ceiling
+            )
+        return diag
+
+    def _log_intent_diagnostics(self, diag):
+        flags = []
+        for prefix in ("rec", "src"):
+            if diag.get(f"{prefix}_collapse", False):
+                flags.append(f"{prefix}_intent_collapse")
+            if diag.get(f"{prefix}_transition_collapse", False):
+                flags.append(f"{prefix}_transition_collapse")
+            if diag.get(f"{prefix}_non_convergent_risk", False):
+                flags.append(f"{prefix}_cycle_risk")
+        flag_text = ",".join(flags) if flags else "ok"
+        print("[IntentDiag]",
+              f"step={self._intent_diag_counter}",
+              f"flags={flag_text}",
+              f"rec_H={diag['rec_entropy']:.3f}",
+              f"rec_top1={diag['rec_top1']:.3f}",
+              f"rec_eff={diag['rec_effective']:.2f}",
+              f"rec_proto={diag['rec_proto_sim']:.3f}",
+              f"rec_T_H={diag['rec_transition_entropy']:.3f}",
+              f"rec_T_peak={diag['rec_transition_peak']:.3f}",
+              f"rec_cycle={diag['rec_cycle_gap']:.3f}",
+              f"src_H={diag['src_entropy']:.3f}",
+              f"src_top1={diag['src_top1']:.3f}",
+              f"src_eff={diag['src_effective']:.2f}",
+              f"src_proto={diag['src_proto_sim']:.3f}",
+              f"src_T_H={diag['src_transition_entropy']:.3f}",
+              f"src_T_peak={diag['src_transition_peak']:.3f}",
+              f"src_cycle={diag['src_cycle_gap']:.3f}")
 
     def _current_item_anchor(self, items_emb: torch.Tensor):
         if items_emb.dim() == 3:
@@ -439,6 +566,26 @@ class UniSAR(BaseModel):
         rec_intents = self.rec_intent_discovery(rec2rec, rec_pad_mask)
         src_intents = self.src_intent_discovery(src2src, src_pad_mask)
         r2s_probs, s2r_probs = self.intent_transition_graph(rec_intents, src_intents)
+        if self.intent_diag:
+            with torch.no_grad():
+                rec_assign = self._intent_soft_assign(rec2rec.detach(),
+                                                      rec_intents.detach(),
+                                                      pad_mask=rec_pad_mask)
+                src_assign = self._intent_soft_assign(src2src.detach(),
+                                                      src_intents.detach(),
+                                                      pad_mask=src_pad_mask)
+                self._last_intent_diag = self._collect_intent_diagnostics(
+                    rec_assign=rec_assign,
+                    src_assign=src_assign,
+                    rec_intents=rec_intents.detach(),
+                    src_intents=src_intents.detach(),
+                    r2s_probs=r2s_probs.detach(),
+                    s2r_probs=s2r_probs.detach(),
+                    rec_pad_mask=rec_pad_mask,
+                    src_pad_mask=src_pad_mask)
+                self._intent_diag_counter += 1
+                if self._intent_diag_counter % max(1, self.intent_diag_interval) == 0:
+                    self._log_intent_diagnostics(self._last_intent_diag)
         src_source_available = (~src_pad_mask).any(dim=1, keepdim=True).expand_as(rec_pad_mask)
         rec_source_available = (~rec_pad_mask).any(dim=1, keepdim=True).expand_as(src_pad_mask)
 

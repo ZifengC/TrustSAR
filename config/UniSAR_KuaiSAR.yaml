@@ -28,3 +28,11 @@ intent_heads: 2
 intent_temp: 1.0
 intent_dropout: 0.1
 transition_dynamic_hidden: 64
+intent_diag: false
+intent_diag_interval: 200
+intent_entropy_floor: 0.45
+intent_top1_ceiling: 0.75
+intent_proto_sim_ceiling: 0.85
+transition_entropy_floor: 0.35
+transition_peak_ceiling: 0.85
+transition_cycle_ceiling: 0.90
