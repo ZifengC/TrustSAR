@@ -38,15 +38,13 @@ class UniSAR(BaseModel):
         parser.add_argument('--intent_heads', type=int, default=2)
         parser.add_argument('--intent_temp', type=float, default=1.0)
         parser.add_argument('--intent_dropout', type=float, default=0.1)
-        parser.add_argument('--transition_dynamic_hidden', type=int, default=64)
+        parser.add_argument('--belief_decay', type=float, default=0.9)
+        parser.add_argument('--belief_eps', type=float, default=1e-8)
         parser.add_argument('--intent_diag', action='store_true')
         parser.add_argument('--intent_diag_interval', type=int, default=200)
         parser.add_argument('--intent_entropy_floor', type=float, default=0.45)
         parser.add_argument('--intent_top1_ceiling', type=float, default=0.75)
         parser.add_argument('--intent_proto_sim_ceiling', type=float, default=0.85)
-        parser.add_argument('--transition_entropy_floor', type=float, default=0.35)
-        parser.add_argument('--transition_peak_ceiling', type=float, default=0.85)
-        parser.add_argument('--transition_cycle_ceiling', type=float, default=0.90)
 
         return BaseModel.parse_model_args(parser)
 
@@ -155,6 +153,8 @@ class UniSAR(BaseModel):
         self.rec_use_src_interest = args.rec_use_src_interest
         self.intent_num = args.intent_num
         self.intent_temp = args.intent_temp
+        self.belief_decay = args.belief_decay
+        self.belief_eps = args.belief_eps
         # 双分支信任记忆：src 用于 memory=rec2src / tgt=src2src，rec 用于 memory=src2rec / tgt=rec2rec
         self.src_memory_trust_memory = TrustMemory(dim=self.item_size,
                                                        epsilon=self.memory_eps,
@@ -172,20 +172,11 @@ class UniSAR(BaseModel):
                                                     epsilon=self.memory_eps,
                                                     clamp_min=args.memory_bias_min,
                                                     clamp_max=args.memory_bias_max)
-        self.rec_intent_discovery = LatentIntentDiscovery(
+        self.shared_intent_discovery = LatentIntentDiscovery(
             emb_dim=self.item_size,
             num_intents=self.intent_num,
             num_heads=args.intent_heads,
             dropout=args.intent_dropout)
-        self.src_intent_discovery = LatentIntentDiscovery(
-            emb_dim=self.item_size,
-            num_intents=self.intent_num,
-            num_heads=args.intent_heads,
-            dropout=args.intent_dropout)
-        self.intent_transition_graph = IntentTransitionGraph(
-            emb_dim=self.item_size,
-            num_intents=self.intent_num,
-            hidden_dim=args.transition_dynamic_hidden)
         self.memory_log = args.memory_log
         self.memory_log_interval = args.memory_log_interval
         self.intent_diag = args.intent_diag
@@ -193,9 +184,6 @@ class UniSAR(BaseModel):
         self.intent_entropy_floor = args.intent_entropy_floor
         self.intent_top1_ceiling = args.intent_top1_ceiling
         self.intent_proto_sim_ceiling = args.intent_proto_sim_ceiling
-        self.transition_entropy_floor = args.transition_entropy_floor
-        self.transition_peak_ceiling = args.transition_peak_ceiling
-        self.transition_cycle_ceiling = args.transition_cycle_ceiling
         self._memory_log_counter = 0
         self._last_trust_bias = None
         self._intent_diag_counter = 0
@@ -332,100 +320,53 @@ class UniSAR(BaseModel):
 
     @torch.no_grad()
     def _collect_intent_diagnostics(self,
-                                    rec_assign: torch.Tensor,
-                                    src_assign: torch.Tensor,
-                                    rec_intents: torch.Tensor,
-                                    src_intents: torch.Tensor,
-                                    r2s_probs: torch.Tensor,
-                                    s2r_probs: torch.Tensor,
-                                    rec_pad_mask: torch.Tensor,
-                                    src_pad_mask: torch.Tensor):
+                                    assign: torch.Tensor,
+                                    intents: torch.Tensor,
+                                    pad_mask: torch.Tensor,
+                                    belief_trace: torch.Tensor):
         diag = {}
-        valid_groups = [
-            ("rec", rec_assign, rec_intents, rec_pad_mask),
-            ("src", src_assign, src_intents, src_pad_mask)
-        ]
-        for name, assign, intents, pad_mask in valid_groups:
-            valid_mask = (~pad_mask).unsqueeze(-1).float()
-            valid_count = valid_mask.sum().clamp(min=1.0)
-            entropy = self._normalized_entropy(assign, dim=-1)
-            entropy = (entropy * valid_mask.squeeze(-1)).sum() / valid_count
-            top1 = (assign.max(dim=-1).values * valid_mask.squeeze(-1)).sum() / valid_count
-            usage = (assign * valid_mask).sum(dim=(0, 1)) / valid_count
-            proto = F.normalize(intents.mean(dim=0), dim=-1)
-            proto_sim = torch.matmul(proto, proto.transpose(0, 1))
-            proto_mask = ~torch.eye(proto_sim.size(0),
-                                    dtype=torch.bool,
-                                    device=proto_sim.device)
-            if proto_mask.any():
-                proto_sim_mean = proto_sim.masked_select(proto_mask).mean()
-            else:
-                proto_sim_mean = torch.tensor(0.0, device=proto_sim.device)
-            usage_entropy = self._normalized_entropy(usage.unsqueeze(0), dim=-1).squeeze(0)
-            effective = torch.exp(usage_entropy * math.log(max(usage.numel(), 2)))
-            diag[f"{name}_entropy"] = entropy.item()
-            diag[f"{name}_top1"] = top1.item()
-            diag[f"{name}_effective"] = effective.item()
-            diag[f"{name}_usage_peak"] = usage.max().item()
-            diag[f"{name}_proto_sim"] = proto_sim_mean.item()
-            diag[f"{name}_collapse"] = (
-                entropy.item() < self.intent_entropy_floor or
-                top1.item() > self.intent_top1_ceiling or
-                proto_sim_mean.item() > self.intent_proto_sim_ceiling
-            )
-
-        round_trip_groups = [
-            ("rec", torch.bmm(r2s_probs, s2r_probs)),
-            ("src", torch.bmm(s2r_probs, r2s_probs))
-        ]
-        for name, transition in round_trip_groups:
-            row_entropy = self._normalized_entropy(transition, dim=-1).mean()
-            row_peak = transition.max(dim=-1).values.mean()
-            trace_mean = transition.diagonal(dim1=-2, dim2=-1).mean()
-            cycle_gap = (row_peak - trace_mean).clamp(min=0.0)
-            offdiag_mass = (1.0 - trace_mean).clamp(min=0.0, max=1.0)
-            diag[f"{name}_transition_entropy"] = row_entropy.item()
-            diag[f"{name}_transition_peak"] = row_peak.item()
-            diag[f"{name}_transition_trace"] = trace_mean.item()
-            diag[f"{name}_cycle_gap"] = cycle_gap.item()
-            diag[f"{name}_transition_offdiag"] = offdiag_mass.item()
-            diag[f"{name}_non_convergent_risk"] = (
-                row_entropy.item() < self.transition_entropy_floor and
-                offdiag_mass.item() > self.transition_cycle_ceiling
-            )
-            diag[f"{name}_transition_collapse"] = (
-                row_entropy.item() < self.transition_entropy_floor or
-                row_peak.item() > self.transition_peak_ceiling
-            )
+        valid_mask = (~pad_mask).unsqueeze(-1).float()
+        valid_count = valid_mask.sum().clamp(min=1.0)
+        entropy = self._normalized_entropy(assign, dim=-1)
+        entropy = (entropy * valid_mask.squeeze(-1)).sum() / valid_count
+        top1 = (assign.max(dim=-1).values * valid_mask.squeeze(-1)).sum() / valid_count
+        usage = (assign * valid_mask).sum(dim=(0, 1)) / valid_count
+        proto = F.normalize(intents.mean(dim=0), dim=-1)
+        proto_sim = torch.matmul(proto, proto.transpose(0, 1))
+        proto_mask = ~torch.eye(proto_sim.size(0),
+                                dtype=torch.bool,
+                                device=proto_sim.device)
+        if proto_mask.any():
+            proto_sim_mean = proto_sim.masked_select(proto_mask).mean()
+        else:
+            proto_sim_mean = torch.tensor(0.0, device=proto_sim.device)
+        usage_entropy = self._normalized_entropy(usage.unsqueeze(0), dim=-1).squeeze(0)
+        effective = torch.exp(usage_entropy * math.log(max(usage.numel(), 2)))
+        belief_entropy = self._normalized_entropy(belief_trace, dim=-1)
+        belief_entropy = (belief_entropy * valid_mask.squeeze(-1)).sum() / valid_count
+        diag["intent_entropy"] = entropy.item()
+        diag["intent_top1"] = top1.item()
+        diag["intent_effective"] = effective.item()
+        diag["intent_usage_peak"] = usage.max().item()
+        diag["intent_proto_sim"] = proto_sim_mean.item()
+        diag["belief_entropy"] = belief_entropy.item()
+        diag["intent_collapse"] = (
+            entropy.item() < self.intent_entropy_floor or
+            top1.item() > self.intent_top1_ceiling or
+            proto_sim_mean.item() > self.intent_proto_sim_ceiling
+        )
         return diag
 
     def _log_intent_diagnostics(self, diag):
-        flags = []
-        for prefix in ("rec", "src"):
-            if diag.get(f"{prefix}_collapse", False):
-                flags.append(f"{prefix}_intent_collapse")
-            if diag.get(f"{prefix}_transition_collapse", False):
-                flags.append(f"{prefix}_transition_collapse")
-            if diag.get(f"{prefix}_non_convergent_risk", False):
-                flags.append(f"{prefix}_cycle_risk")
-        flag_text = ",".join(flags) if flags else "ok"
+        flag_text = "intent_collapse" if diag.get("intent_collapse", False) else "ok"
         print("[IntentDiag]",
               f"step={self._intent_diag_counter}",
               f"flags={flag_text}",
-              f"rec_H={diag['rec_entropy']:.3f}",
-              f"rec_top1={diag['rec_top1']:.3f}",
-              f"rec_eff={diag['rec_effective']:.2f}",
-              f"rec_proto={diag['rec_proto_sim']:.3f}",
-              f"rec_T_H={diag['rec_transition_entropy']:.3f}",
-              f"rec_T_peak={diag['rec_transition_peak']:.3f}",
-              f"rec_cycle={diag['rec_cycle_gap']:.3f}",
-              f"src_H={diag['src_entropy']:.3f}",
-              f"src_top1={diag['src_top1']:.3f}",
-              f"src_eff={diag['src_effective']:.2f}",
-              f"src_proto={diag['src_proto_sim']:.3f}",
-              f"src_T_H={diag['src_transition_entropy']:.3f}",
-              f"src_T_peak={diag['src_transition_peak']:.3f}",
-              f"src_cycle={diag['src_cycle_gap']:.3f}")
+              f"H={diag['intent_entropy']:.3f}",
+              f"top1={diag['intent_top1']:.3f}",
+              f"eff={diag['intent_effective']:.2f}",
+              f"proto={diag['intent_proto_sim']:.3f}",
+              f"belief_H={diag['belief_entropy']:.3f}")
 
     def _current_item_anchor(self, items_emb: torch.Tensor):
         if items_emb.dim() == 3:
@@ -433,37 +374,49 @@ class UniSAR(BaseModel):
             return items_emb[:, 0, :]
         return items_emb
 
-    def _intent_routing_bias(self,
-                             transition: torch.Tensor,
-                             position_item: torch.Tensor,
-                             src_intents: torch.Tensor,
-                             tgt_intents: torch.Tensor,
-                             src_to_tgt_probs: torch.Tensor,
-                             pad_mask: torch.Tensor,
-                             update_mask: torch.Tensor,
-                             memory_module):
+    def _ema_intent_belief(self,
+                           assign: torch.Tensor,
+                           pad_mask: torch.Tensor):
+        belief = assign.new_full((assign.size(0), assign.size(-1)),
+                                 1.0 / max(assign.size(-1), 1))
+        traces = []
+        decay = min(max(self.belief_decay, 0.0), 1.0)
+        for t in range(assign.size(1)):
+            valid_t = (~pad_mask[:, t]).unsqueeze(-1)
+            new_belief = decay * belief + (1.0 - decay) * assign[:, t, :]
+            new_belief = new_belief / new_belief.sum(
+                dim=-1, keepdim=True).clamp_min(self.belief_eps)
+            belief = torch.where(valid_t, new_belief, belief)
+            traces.append(belief)
+        return torch.stack(traces, dim=1)
+
+    def _intent_match_bias(self,
+                           transition: torch.Tensor,
+                           position_item: torch.Tensor,
+                           shared_intents: torch.Tensor,
+                           belief_trace: torch.Tensor,
+                           pad_mask: torch.Tensor,
+                           update_mask: torch.Tensor,
+                           memory_module):
         valid_mask = (~pad_mask)
         if update_mask is not None:
             valid_mask = valid_mask & update_mask
 
-        # Semantic confidence of each transition step under current history position item.
         alpha_abs = torch.abs((transition * position_item).sum(dim=-1))
         alpha_conf = torch.tanh(alpha_abs).masked_fill(~valid_mask, 0.0)
 
-        item_tgt_logits = torch.einsum("btd,bkd->btk", position_item, tgt_intents)
-        item_tgt_logits = item_tgt_logits / (position_item.size(-1) ** 0.5 * max(self.intent_temp, 1e-6))
-        item_tgt_assign = torch.softmax(item_tgt_logits, dim=-1)
-        src_demand = torch.einsum("btk,bmk->btm", item_tgt_assign, src_to_tgt_probs.transpose(1, 2))
-        mem_src_assign = self._intent_soft_assign(transition, src_intents, pad_mask=pad_mask)
+        transition_assign = self._intent_soft_assign(transition,
+                                                     shared_intents,
+                                                     pad_mask=pad_mask)
+        anchor_assign = self._intent_soft_assign(position_item,
+                                                 shared_intents,
+                                                 pad_mask=pad_mask)
+        intent_match = (transition_assign * anchor_assign).sum(dim=-1)
+        intent_match = intent_match.masked_fill(~valid_mask, 0.0)
+        belief_support = (anchor_assign * belief_trace).sum(dim=-1)
+        belief_support = belief_support.masked_fill(~valid_mask, 0.0)
 
-        route_match = (src_demand * mem_src_assign).sum(dim=-1)
-        route_match = route_match.masked_fill(~valid_mask, 0.0)
-
-        src_reliability_per_intent = src_to_tgt_probs.max(dim=-1).values
-        src_reliability = (mem_src_assign * src_reliability_per_intent.unsqueeze(1)).sum(dim=-1)
-        src_reliability = src_reliability.masked_fill(~valid_mask, 0.0)
-
-        confidence = alpha_conf * route_match * src_reliability
+        confidence = alpha_conf * intent_match * belief_support
         confidence = confidence.masked_fill(pad_mask, 0.0)
         confidence = confidence.clamp(min=0.0, max=1.0)
 
@@ -563,26 +516,19 @@ class UniSAR(BaseModel):
         self._check_finite("rec2rec", rec2rec)
         self._check_finite("src2src", src2src)
 
-        rec_intents = self.rec_intent_discovery(rec2rec, rec_pad_mask)
-        src_intents = self.src_intent_discovery(src2src, src_pad_mask)
-        r2s_probs, s2r_probs = self.intent_transition_graph(rec_intents, src_intents)
+        shared_intents = self.shared_intent_discovery(all_his_emb, all_his_mask)
+        shared_assign = self._intent_soft_assign(all_his_emb,
+                                                shared_intents,
+                                                pad_mask=all_his_mask)
+        belief_trace = self._ema_intent_belief(shared_assign, all_his_mask)
+        rec_belief, src_belief = self.split_rec_src(belief_trace, all_his_type)
         if self.intent_diag:
             with torch.no_grad():
-                rec_assign = self._intent_soft_assign(rec2rec.detach(),
-                                                      rec_intents.detach(),
-                                                      pad_mask=rec_pad_mask)
-                src_assign = self._intent_soft_assign(src2src.detach(),
-                                                      src_intents.detach(),
-                                                      pad_mask=src_pad_mask)
                 self._last_intent_diag = self._collect_intent_diagnostics(
-                    rec_assign=rec_assign,
-                    src_assign=src_assign,
-                    rec_intents=rec_intents.detach(),
-                    src_intents=src_intents.detach(),
-                    r2s_probs=r2s_probs.detach(),
-                    s2r_probs=s2r_probs.detach(),
-                    rec_pad_mask=rec_pad_mask,
-                    src_pad_mask=src_pad_mask)
+                    assign=shared_assign.detach(),
+                    intents=shared_intents.detach(),
+                    pad_mask=all_his_mask,
+                    belief_trace=belief_trace.detach())
                 self._intent_diag_counter += 1
                 if self._intent_diag_counter % max(1, self.intent_diag_interval) == 0:
                     self._log_intent_diagnostics(self._last_intent_diag)
@@ -598,12 +544,11 @@ class UniSAR(BaseModel):
             update_mask=rec_has_click,
             memory_module=self.rec_tgt_trust_memory)
 
-        rec_memory_trust_bias = self._intent_routing_bias(
+        rec_memory_trust_bias = self._intent_match_bias(
             transition=src2rec,
             position_item=rec_his_emb,
-            src_intents=src_intents,
-            tgt_intents=rec_intents,
-            src_to_tgt_probs=s2r_probs,
+            shared_intents=shared_intents,
+            belief_trace=rec_belief,
             pad_mask=rec_pad_mask,
             update_mask=src_source_available,
             memory_module=self.rec_memory_trust_memory)
@@ -627,13 +572,12 @@ class UniSAR(BaseModel):
                                             src_selector).reshape(
                                                 (has_click.size(0),
                                                  src_len))
-        # src 分支 memory gate：统一 confidence（三因子）
-        src_memory_trust_bias = self._intent_routing_bias(
+        # src 分支 memory gate：intent match + EMA belief
+        src_memory_trust_bias = self._intent_match_bias(
             transition=rec2src,
             position_item=src_mean_click,
-            src_intents=rec_intents,
-            tgt_intents=src_intents,
-            src_to_tgt_probs=r2s_probs,
+            shared_intents=shared_intents,
+            belief_trace=src_belief,
             pad_mask=src_pad_mask,
             update_mask=rec_source_available,
             memory_module=self.src_memory_trust_memory)
@@ -1034,43 +978,6 @@ class LatentIntentDiscovery(nn.Module):
                                          key_padding_mask=pad_mask)
         intents = self.norm(intents + slots)
         return intents
-
-
-class IntentTransitionGraph(nn.Module):
-    def __init__(self,
-                 emb_dim: int,
-                 num_intents: int,
-                 hidden_dim: int = 64):
-        super().__init__()
-        self.num_intents = num_intents
-        self.r2s_global = nn.Parameter(torch.zeros(num_intents, num_intents))
-        self.s2r_global = nn.Parameter(torch.zeros(num_intents, num_intents))
-        self.r2s_dynamic = nn.Sequential(nn.Linear(2 * emb_dim, hidden_dim),
-                                         nn.ReLU(),
-                                         nn.Linear(hidden_dim,
-                                                   num_intents * num_intents))
-        self.s2r_dynamic = nn.Sequential(nn.Linear(2 * emb_dim, hidden_dim),
-                                         nn.ReLU(),
-                                         nn.Linear(hidden_dim,
-                                                   num_intents * num_intents))
-
-    def forward(self, rec_intents: torch.Tensor, src_intents: torch.Tensor):
-        rec_summary = rec_intents.mean(dim=1)
-        src_summary = src_intents.mean(dim=1)
-        user_ctx = torch.cat([rec_summary, src_summary], dim=-1)
-
-        r2s_delta = self.r2s_dynamic(user_ctx).reshape(-1,
-                                                       self.num_intents,
-                                                       self.num_intents)
-        s2r_delta = self.s2r_dynamic(user_ctx).reshape(-1,
-                                                       self.num_intents,
-                                                       self.num_intents)
-
-        r2s_logits = self.r2s_global.unsqueeze(0) + r2s_delta
-        s2r_logits = self.s2r_global.unsqueeze(0) + s2r_delta
-        r2s_probs = torch.softmax(r2s_logits, dim=-1)
-        s2r_probs = torch.softmax(s2r_logits, dim=-1)
-        return r2s_probs, s2r_probs
 
 
 class TrustMemory(nn.Module):
