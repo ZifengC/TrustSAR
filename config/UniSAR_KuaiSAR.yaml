@@ -27,4 +27,5 @@ intent_num: 4
 intent_heads: 2
 intent_temp: 1.0
 intent_dropout: 0.1
-transition_dynamic_hidden: 64
+belief_decay: 0.9
+belief_eps: 0.00000001
